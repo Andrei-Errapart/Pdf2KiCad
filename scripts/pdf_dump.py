@@ -39,6 +39,9 @@ WIRE_COLOR = "#4200ff"
 PIN_NUMBER_COLOR = "#000000"
 PIN_NAME_COLOR = "#0000cc"
 GLOBAL_LABEL_TEXT_COLOR = "#ff0000"
+GLOBAL_LABEL_PAGE_REFERENCE_RE = re.compile(
+    r"<[0-9]+(?:\s*,\s*[0-9]+)*>"
+)
 GEOM_TOL = 0.18
 EDGE_TOL = 0.30
 MIN_SYMBOL_W = 2.0
@@ -711,6 +714,142 @@ def _text_chevron_score(text: dict, chevron: dict) -> float | None:
     return gap + cross_distance
 
 
+def _complete_chevron_line_indexes(
+    selected: dict,
+    chevrons: list[dict],
+) -> list[int]:
+    """Return every arm in one compact OrCAD port glyph."""
+    indexes = set(selected["line_indexes"])
+    frontier = [selected["base"]]
+    seen = {tuple(selected["line_indexes"])}
+    axis_index = 0 if selected["axis"] == "horizontal" else 1
+    chevron_depth = abs(
+        selected["apex"][axis_index] - selected["base"][axis_index]
+    )
+    join_tolerance = max(CHEVRON_POINT_TOL, chevron_depth * 0.5)
+    while frontier:
+        point = frontier.pop()
+        for chevron in chevrons:
+            key = tuple(chevron["line_indexes"])
+            if (
+                key in seen
+                or chevron["axis"] != selected["axis"]
+                or chevron["direction"] != selected["direction"]
+                or not _points_close(
+                    chevron["apex"],
+                    point,
+                    join_tolerance,
+                )
+            ):
+                continue
+            seen.add(key)
+            indexes.update(chevron["line_indexes"])
+            frontier.append(chevron["base"])
+
+    # Bidirectional ports add an opposite-facing pair on the wire side.  It is
+    # separated from the text-side chain by a small gap, but shares its axis
+    # and centreline.  Grow the compact glyph interval without absorbing ports
+    # on adjacent, closely stacked wires.
+    cross_index = 1 - axis_index
+    selected_cross = (
+        selected["apex"][cross_index] + selected["base"][cross_index]
+    ) / 2
+    cross_tolerance = max(CHEVRON_POINT_TOL * 1.5, chevron_depth * 0.3)
+    changed = True
+    while changed:
+        changed = False
+        included = [
+            chevron
+            for chevron in chevrons
+            if tuple(chevron["line_indexes"]) in seen
+        ]
+        interval_start = min(
+            min(chevron["apex"][axis_index], chevron["base"][axis_index])
+            for chevron in included
+        )
+        interval_end = max(
+            max(chevron["apex"][axis_index], chevron["base"][axis_index])
+            for chevron in included
+        )
+        for chevron in chevrons:
+            key = tuple(chevron["line_indexes"])
+            chevron_cross = (
+                chevron["apex"][cross_index]
+                + chevron["base"][cross_index]
+            ) / 2
+            chevron_start = min(
+                chevron["apex"][axis_index],
+                chevron["base"][axis_index],
+            )
+            chevron_end = max(
+                chevron["apex"][axis_index],
+                chevron["base"][axis_index],
+            )
+            interval_gap = max(
+                interval_start - chevron_end,
+                chevron_start - interval_end,
+                0.0,
+            )
+            if (
+                key in seen
+                or chevron["axis"] != selected["axis"]
+                or abs(chevron_cross - selected_cross) > cross_tolerance
+                or interval_gap > chevron_depth
+            ):
+                continue
+            seen.add(key)
+            indexes.update(chevron["line_indexes"])
+            changed = True
+    return sorted(indexes)
+
+
+def _page_reference_for_label(
+    label_text: dict,
+    direction: str,
+    texts: list[dict],
+) -> dict | None:
+    """Find the red <page,...> annotation immediately beyond a port name."""
+    size = max(float(label_text.get("size", 0.0)), 0.1)
+    angle = int(round(label_text.get("angle", 0.0))) % 360
+    horizontal = direction in ("left", "right")
+    label_cross = (
+        (label_text["y"] + label_text["y1"]) / 2
+        if horizontal
+        else (label_text["x"] + label_text["x1"]) / 2
+    )
+    candidates = []
+    for text in texts:
+        value = text.get("text", "").strip()
+        if (
+            text is label_text
+            or text.get("color") != GLOBAL_LABEL_TEXT_COLOR
+            or not GLOBAL_LABEL_PAGE_REFERENCE_RE.fullmatch(value)
+            or int(round(text.get("angle", 0.0))) % 360 != angle
+            or abs(float(text.get("size") or 0.0) - size) > size * 0.35
+        ):
+            continue
+        text_cross = (
+            (text["y"] + text["y1"]) / 2
+            if horizontal
+            else (text["x"] + text["x1"]) / 2
+        )
+        cross_distance = abs(text_cross - label_cross)
+        if direction == "right":
+            gap = text["x"] - label_text["x1"]
+        elif direction == "left":
+            gap = label_text["x"] - text["x1"]
+        elif direction == "down":
+            gap = text["y"] - label_text["y1"]
+        else:
+            gap = label_text["y"] - text["y1"]
+        if (
+            -GEOM_TOL <= gap <= max(1.5, size * 3.0)
+            and cross_distance <= max(0.45, size * 0.35)
+        ):
+            candidates.append((max(gap, 0.0) + cross_distance, text))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
 def decode_global_labels(page_data: dict) -> list[dict]:
     """Decode OrCAD off-page ports from red text plus chevron geometry.
 
@@ -725,7 +864,7 @@ def decode_global_labels(page_data: dict) -> list[dict]:
         name = text.get("text", "").strip()
         if not name or text.get("color") != GLOBAL_LABEL_TEXT_COLOR:
             continue
-        if re.fullmatch(r"<[0-9, ]+>", name):
+        if GLOBAL_LABEL_PAGE_REFERENCE_RE.fullmatch(name):
             continue
         angle = int(round(text.get("angle", 0.0))) % 360
         if angle not in (0, 90, 180, 270):
@@ -747,12 +886,55 @@ def decode_global_labels(page_data: dict) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
+        line_indexes = _complete_chevron_line_indexes(
+            chevron,
+            chevrons,
+        )
+        glyph_points = [
+            point
+            for line_index in line_indexes
+            for point in _line_points(page_data["lines"][line_index])
+        ]
+        if chevron["axis"] == "horizontal":
+            hot_x = (
+                min(point[0] for point in glyph_points)
+                if chevron["direction"] == "right"
+                else max(point[0] for point in glyph_points)
+            )
+            hotpoint = (hot_x, chevron["apex"][1])
+        else:
+            hot_y = (
+                min(point[1] for point in glyph_points)
+                if chevron["direction"] == "down"
+                else max(point[1] for point in glyph_points)
+            )
+            hotpoint = (chevron["apex"][0], hot_y)
+        page_reference = _page_reference_for_label(
+            text,
+            chevron["direction"],
+            page_data["texts"],
+        )
         labels.append({
             "name": name,
             "direction": chevron["direction"],
             "angle": angle,
             "apex": _point_dict(chevron["apex"]),
             "base": _point_dict(chevron["base"]),
+            "hotpoint": _point_dict(hotpoint),
+            "line_indexes": line_indexes,
+            "page_references": (
+                [{
+                    "text": page_reference["text"],
+                    "x": page_reference["x"],
+                    "y": page_reference["y"],
+                    "x1": page_reference["x1"],
+                    "y1": page_reference["y1"],
+                    "size": page_reference.get("size"),
+                    "angle": page_reference.get("angle"),
+                    "color": page_reference.get("color"),
+                }]
+                if page_reference else []
+            ),
             "text": {
                 "x": text["x"], "y": text["y"],
                 "x1": text["x1"], "y1": text["y1"],
@@ -764,6 +946,582 @@ def decode_global_labels(page_data: dict) -> list[dict]:
         label["text"]["y"], label["text"]["x"], label["name"],
     ))
     return labels
+
+
+WORKSHEET_LABEL_ALIASES = {
+    "title": {"title"},
+    "size": {"size"},
+    "document_number": {
+        "document number", "document no", "doc no", "code-nr.", "km-nr.",
+    },
+    "revision": {"rev", "revision", "issue", "swv"},
+    "date": {"date"},
+    "sheet": {"sheet", "page"},
+    "page_name": {"page name"},
+    "of": {"of", "o f"},
+}
+
+
+def _worksheet_frame(page_data: dict) -> dict | None:
+    """Find Capture's inset drawing frame without relying on a paper size."""
+    width = page_data["width"]
+    height = page_data["height"]
+    horizontals = []
+    verticals = []
+    for index, line in enumerate(page_data["lines"]):
+        if line.get("color") != "#000000":
+            continue
+        x0, x1 = sorted((line["x1"], line["x2"]))
+        y0, y1 = sorted((line["y1"], line["y2"]))
+        if y1 - y0 <= GEOM_TOL and x1 - x0 >= width * 0.80:
+            horizontals.append((index, x0, x1, (y0 + y1) / 2))
+        if x1 - x0 <= GEOM_TOL and y1 - y0 >= height * 0.80:
+            verticals.append((index, (x0 + x1) / 2, y0, y1))
+
+    tolerance = max(0.45, GEOM_TOL * 2)
+    candidates = []
+    for top in horizontals:
+        if not 0.3 <= top[3] <= height * 0.10:
+            continue
+        for bottom in horizontals:
+            if (
+                # "Fit to page" exports can leave a sizeable unused bottom
+                # margin while the frame itself still spans most of the page.
+                bottom[3] <= height * 0.78
+                or abs(top[1] - bottom[1]) > tolerance
+                or abs(top[2] - bottom[2]) > tolerance
+            ):
+                continue
+            for left in verticals:
+                if (
+                    abs(left[1] - top[1]) > tolerance
+                    or abs(left[2] - top[3]) > tolerance
+                    or abs(left[3] - bottom[3]) > tolerance
+                ):
+                    continue
+                for right in verticals:
+                    if (
+                        abs(right[1] - top[2]) > tolerance
+                        or abs(right[2] - top[3]) > tolerance
+                        or abs(right[3] - bottom[3]) > tolerance
+                    ):
+                        continue
+                    candidates.append({
+                        "x0": top[1],
+                        "y0": top[3],
+                        "x1": top[2],
+                        "y1": bottom[3],
+                        "line_indexes": [
+                            top[0], right[0], bottom[0], left[0],
+                        ],
+                    })
+    if not candidates:
+        return None
+    # Some exporters draw both an outer trim border and the actual coordinate
+    # frame.  The most inset qualifying rectangle is the worksheet frame.
+    return min(
+        candidates,
+        key=lambda box: (
+            (box["x1"] - box["x0"]) * (box["y1"] - box["y0"]),
+            -box["x0"] - box["y0"],
+        ),
+    )
+
+
+def _worksheet_label_name(value: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", value.strip().lower().rstrip(":"))
+    for name, aliases in WORKSHEET_LABEL_ALIASES.items():
+        if normalized in aliases:
+            return name
+    return None
+
+
+def _worksheet_text_values(cell: dict, texts: list[dict]) -> list[str]:
+    values = []
+    seen = set()
+    tolerance = max(0.35, GEOM_TOL * 2)
+    for text in sorted(texts, key=lambda item: (item["x"], item["y"])):
+        center = (
+            (text["x"] + text["x1"]) / 2,
+            (text["y"] + text["y1"]) / 2,
+        )
+        if not (
+            cell["x0"] - tolerance <= center[0] <= cell["x1"] + tolerance
+            and cell["y0"] - tolerance <= center[1] <= cell["y1"] + tolerance
+        ):
+            continue
+        value = text.get("text", "").strip()
+        key = (
+            value,
+            round(text["x"] / GEOM_TOL),
+            round(text["y"] / GEOM_TOL),
+        )
+        if (
+            not value
+            or _worksheet_label_name(value) is not None
+            or key in seen
+        ):
+            continue
+        seen.add(key)
+        values.append(value)
+    return values
+
+
+def _boxes_touch(first: dict, second: dict, tolerance: float) -> bool:
+    return not (
+        first["x1"] < second["x0"] - tolerance
+        or second["x1"] < first["x0"] - tolerance
+        or first["y1"] < second["y0"] - tolerance
+        or second["y1"] < first["y0"] - tolerance
+    )
+
+
+def _primitive_bbox(primitive: dict) -> dict:
+    if "points" in primitive:
+        points = primitive["points"]
+        return {
+            "x0": min(point[0] for point in points),
+            "y0": min(point[1] for point in points),
+            "x1": max(point[0] for point in points),
+            "y1": max(point[1] for point in points),
+        }
+    if "x2" in primitive:
+        return {
+            "x0": min(primitive["x1"], primitive["x2"]),
+            "y0": min(primitive["y1"], primitive["y2"]),
+            "x1": max(primitive["x1"], primitive["x2"]),
+            "y1": max(primitive["y1"], primitive["y2"]),
+        }
+    if "x" in primitive:
+        return {
+            "x0": min(primitive["x"], primitive["x1"]),
+            "y0": min(primitive["y"], primitive["y1"]),
+            "x1": max(primitive["x"], primitive["x1"]),
+            "y1": max(primitive["y"], primitive["y1"]),
+        }
+    return {
+        "x0": min(primitive["x0"], primitive.get("x1", primitive["x0"])),
+        "y0": min(primitive["y0"], primitive.get("y1", primitive["y0"])),
+        "x1": max(primitive["x0"], primitive.get("x1", primitive["x0"])),
+        "y1": max(primitive["y0"], primitive.get("y1", primitive["y0"])),
+    }
+
+
+def _worksheet_title_block(
+    page_data: dict,
+    frame: dict,
+    anchors: list[tuple[str, dict]],
+) -> tuple[dict | None, list[dict]]:
+    """Find a variable-layout corner block from its cells or ruled lines."""
+    frame_width = frame["x1"] - frame["x0"]
+    frame_height = frame["y1"] - frame["y0"]
+    tolerance = max(0.5, GEOM_TOL * 3)
+
+    cells = []
+    seen_cells = set()
+    for rectangle in page_data["rectangles"]:
+        if (
+            rectangle.get("color") != "#000000"
+            or rectangle["x0"] < frame["x0"] + frame_width * 0.35
+            or rectangle["y0"] < frame["y0"] + frame_height * 0.60
+            or rectangle["x1"] > frame["x1"] + tolerance
+            or rectangle["y1"] > frame["y1"] + tolerance
+        ):
+            continue
+        key = tuple(
+            round(rectangle[name] / GEOM_TOL)
+            for name in ("x0", "y0", "x1", "y1")
+        )
+        if key not in seen_cells:
+            seen_cells.add(key)
+            cells.append(rectangle)
+
+    components = []
+    for cell in cells:
+        touching = [
+            index
+            for index, component in enumerate(components)
+            if any(_boxes_touch(cell, other, tolerance) for other in component)
+        ]
+        if not touching:
+            components.append([cell])
+            continue
+        merged = [cell]
+        for index in reversed(touching):
+            merged.extend(components.pop(index))
+        components.append(merged)
+
+    def anchor_count(component):
+        return sum(
+            any(
+                cell["x0"] - tolerance <= (text["x"] + text["x1"]) / 2
+                <= cell["x1"] + tolerance
+                and cell["y0"] - tolerance <= (text["y"] + text["y1"]) / 2
+                <= cell["y1"] + tolerance
+                for cell in component
+            )
+            for _name, text in anchors
+        )
+
+    if components:
+        best = max(
+            components,
+            key=lambda component: (anchor_count(component), len(component)),
+        )
+        if anchor_count(best) >= 2:
+            return ({
+                "x0": min(cell["x0"] for cell in best),
+                "y0": min(cell["y0"] for cell in best),
+                "x1": max(cell["x1"] for cell in best),
+                "y1": max(cell["y1"] for cell in best),
+            }, best)
+
+    if len(anchors) < 2:
+        return None, []
+
+    anchor_left = min(text["x"] for _name, text in anchors)
+    probe_left = anchor_left - frame_width * 0.02
+    probe_top = frame["y0"] + frame_height * 0.65
+    minimum_length = max(1.0, min(frame_width, frame_height) * 0.015)
+    structural_lines = []
+    for line in page_data["lines"]:
+        bbox = _primitive_bbox(line)
+        if (
+            line.get("color") == "#000000"
+            and _line_length(line) >= minimum_length
+            and bbox["x0"] >= probe_left
+            and bbox["y0"] >= probe_top
+            and bbox["x1"] <= frame["x1"] + tolerance
+            and bbox["y1"] <= frame["y1"] + tolerance
+        ):
+            structural_lines.append(bbox)
+    if structural_lines:
+        return ({
+            "x0": min(box["x0"] for box in structural_lines),
+            "y0": min(box["y0"] for box in structural_lines),
+            "x1": max(box["x1"] for box in structural_lines),
+            "y1": max(box["y1"] for box in structural_lines),
+        }, [])
+
+    return ({
+        "x0": max(frame["x0"], probe_left),
+        "y0": max(
+            frame["y0"],
+            min(text["y"] for _name, text in anchors) - frame_height * 0.08,
+        ),
+        "x1": frame["x1"],
+        "y1": frame["y1"],
+    }, [])
+
+
+def _is_worksheet_primitive(
+    primitive: dict,
+    frame: dict,
+    title_block: dict | None,
+) -> bool:
+    bbox = _primitive_bbox(primitive)
+    # Text bounding boxes commonly overhang the ruled cell/frame by almost a
+    # millimetre even though their baselines are inside it.
+    tolerance = max(2.0, GEOM_TOL * 10)
+    in_border_band = (
+        bbox["x1"] <= frame["x0"] + tolerance
+        or bbox["x0"] >= frame["x1"] - tolerance
+        or bbox["y1"] <= frame["y0"] + tolerance
+        or bbox["y0"] >= frame["y1"] - tolerance
+    )
+    center = (
+        (bbox["x0"] + bbox["x1"]) / 2,
+        (bbox["y0"] + bbox["y1"]) / 2,
+    )
+    in_title_block = (
+        title_block is not None
+        and title_block["x0"] - tolerance <= center[0]
+        <= title_block["x1"] + tolerance
+        and title_block["y0"] - tolerance <= center[1]
+        <= title_block["y1"] + tolerance
+    )
+    return in_border_band or in_title_block
+
+
+def _unique_worksheet_texts(texts: list[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+    for text in texts:
+        key = (
+            text.get("text", "").strip(),
+            round(text["x"] / GEOM_TOL),
+            round(text["y"] / GEOM_TOL),
+            int(round(text.get("angle", 0.0))) % 360,
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(text)
+    return unique
+
+
+def _worksheet_fields(
+    texts: list[dict],
+    anchors: list[tuple[str, dict]],
+    title_block: dict | None,
+    cells: list[dict],
+) -> dict:
+    if title_block is None:
+        return {}
+    tolerance = max(0.5, GEOM_TOL * 3)
+    block_texts = [
+        text for text in texts
+        if _is_worksheet_primitive(
+            text,
+            {
+                "x0": -1e9, "y0": -1e9,
+                "x1": 1e9, "y1": 1e9,
+            },
+            title_block,
+        )
+    ]
+    anchors_by_name = {}
+    for name, text in anchors:
+        anchors_by_name.setdefault(name, []).append(text)
+
+    def center(text):
+        return (
+            (text["x"] + text["x1"]) / 2,
+            (text["y"] + text["y1"]) / 2,
+        )
+
+    def containing_cells(anchor):
+        point = center(anchor)
+        return sorted(
+            (
+                cell for cell in cells
+                if (
+                    cell["x0"] - tolerance <= point[0] <= cell["x1"] + tolerance
+                    and cell["y0"] - tolerance <= point[1]
+                    <= cell["y1"] + tolerance
+                )
+            ),
+            key=lambda cell: (
+                (cell["x1"] - cell["x0"]) * (cell["y1"] - cell["y0"])
+            ),
+        )
+
+    def nearby_values(name, validator=None):
+        candidates = []
+        for anchor in anchors_by_name.get(name, []):
+            for cell in containing_cells(anchor):
+                values = _worksheet_text_values(cell, block_texts)
+                if validator:
+                    values = [value for value in values if validator(value)]
+                if values:
+                    return values
+            anchor_center = center(anchor)
+            size = max(float(anchor.get("size") or 0), 1.0)
+            for text in block_texts:
+                value = text.get("text", "").strip()
+                if (
+                    not value
+                    or _worksheet_label_name(value) is not None
+                    or (validator and not validator(value))
+                ):
+                    continue
+                text_center = center(text)
+                dx = text["x"] - anchor["x"]
+                dy = text_center[1] - anchor_center[1]
+                if (
+                    dx >= -tolerance
+                    and -size <= dy <= max(size * 4, (
+                        title_block["y1"] - title_block["y0"]
+                    ) * 0.24)
+                ):
+                    candidates.append((
+                        abs(dy) * 3 + max(dx, 0),
+                        value,
+                    ))
+        return [min(candidates)[1]] if candidates else []
+
+    fields = {}
+    title_values = nearby_values("title")
+    if title_values:
+        fields["title"] = max(title_values, key=len)
+    size_values = nearby_values(
+        "size",
+        lambda value: re.fullmatch(
+            r"(?:A[0-5]|[A-E])",
+            value.upper(),
+        ) is not None,
+    )
+    if size_values:
+        fields["size"] = size_values[0].upper()
+    document_values = nearby_values("document_number")
+    if document_values:
+        fields["document_number"] = max(document_values, key=len)
+    revision_values = nearby_values("revision")
+    if revision_values:
+        fields["revision"] = min(revision_values, key=len)
+    date_values = nearby_values("date")
+    if date_values:
+        fields["date"] = max(date_values, key=len)
+    page_name_values = nearby_values("page_name")
+    if page_name_values:
+        fields["page_name"] = max(page_name_values, key=len)
+
+    title_anchors = anchors_by_name.get("title", [])
+    if title_anchors:
+        title_y = min(center(anchor)[1] for anchor in title_anchors)
+        company_candidates = [
+            text.get("text", "").strip()
+            for text in block_texts
+            if (
+                text.get("text", "").strip()
+                and _worksheet_label_name(text.get("text", "")) is None
+                and center(text)[1] < title_y - tolerance
+                and not re.fullmatch(
+                    r"[A-Z0-9]",
+                    text.get("text", "").strip(),
+                )
+            )
+        ]
+        if company_candidates:
+            fields["company"] = max(company_candidates, key=len)
+
+    page_pattern = re.compile(
+        r"(?:page|sheet)\s*:?\s*(\d+)\s*"
+        r"(?:of|o\s*f)\s*(\d+)",
+        re.IGNORECASE,
+    )
+    page_text = None
+    for text in block_texts:
+        match = page_pattern.fullmatch(text.get("text", "").strip())
+        if match:
+            fields["sheet"], fields["sheet_count"] = match.groups()
+            page_text = text
+            break
+
+    if "sheet" not in fields:
+        for anchor in anchors_by_name.get("sheet", []):
+            anchor_center = center(anchor)
+            size = max(float(anchor.get("size") or 0), 1.0)
+            numbers = sorted(
+                (
+                    (center(text)[0], text.get("text", "").strip())
+                    for text in block_texts
+                    if (
+                        re.fullmatch(r"\d+", text.get("text", "").strip())
+                        and center(text)[0] >= anchor_center[0] - tolerance
+                        and abs(center(text)[1] - anchor_center[1])
+                        <= size * 1.5
+                    )
+                ),
+            )
+            if numbers:
+                fields["sheet"] = numbers[0][1]
+            if len(numbers) >= 2:
+                fields["sheet_count"] = numbers[-1][1]
+            if numbers:
+                break
+
+    # Some older line-only blocks put an unlabeled revision immediately after
+    # a combined "PAGE n OF m" span.
+    if "revision" not in fields and page_text is not None:
+        page_center = center(page_text)
+        trailing = [
+            text.get("text", "").strip()
+            for text in block_texts
+            if (
+                text["x"] >= page_text["x1"] - tolerance
+                and abs(center(text)[1] - page_center[1])
+                <= max(float(page_text.get("size") or 0), 1.0)
+                and re.fullmatch(
+                    r"[A-Za-z]?\d+(?:\.\d+)*",
+                    text.get("text", "").strip(),
+                )
+            )
+        ]
+        if trailing:
+            fields["revision"] = min(trailing, key=len)
+    return fields
+
+
+def decode_worksheet(page_data: dict) -> dict | None:
+    """Decode and identify an OrCAD worksheet for native KiCad replacement."""
+    frame = _worksheet_frame(page_data)
+    if frame is None:
+        return None
+
+    frame_width = frame["x1"] - frame["x0"]
+    frame_height = frame["y1"] - frame["y0"]
+    unique_texts = _unique_worksheet_texts(page_data["texts"])
+    anchors = [
+        (name, text)
+        for text in unique_texts
+        if (
+            text["x"] >= frame["x0"] + frame_width * 0.35
+            and text["y"] >= frame["y0"] + frame_height * 0.60
+            and (name := _worksheet_label_name(text.get("text", "")))
+            is not None
+        )
+    ]
+    title_block, cells = _worksheet_title_block(
+        page_data,
+        frame,
+        anchors,
+    )
+    fields = _worksheet_fields(
+        unique_texts,
+        anchors,
+        title_block,
+        cells,
+    )
+
+    line_indexes = {
+        index
+        for index, line in enumerate(page_data["lines"])
+        if _is_worksheet_primitive(line, frame, title_block)
+    }
+    line_indexes.update(frame["line_indexes"])
+    rectangle_indexes = {
+        index
+        for index, rectangle in enumerate(page_data["rectangles"])
+        if (
+            _is_worksheet_primitive(rectangle, frame, title_block)
+            or (
+                rectangle.get("fill") == "#ffffff"
+                and rectangle["x0"] <= frame["x0"]
+                and rectangle["y0"] <= frame["y0"]
+                and rectangle["x1"] >= frame["x1"]
+                and rectangle["y1"] >= frame["y1"]
+            )
+        )
+    }
+    curve_indexes = {
+        index
+        for index, curve in enumerate(page_data["curves"])
+        if _is_worksheet_primitive(curve, frame, title_block)
+    }
+    text_indexes = {
+        index
+        for index, text in enumerate(page_data["texts"])
+        if _is_worksheet_primitive(text, frame, title_block)
+    }
+
+    return {
+        "frame": {
+            name: _round_coord(frame[name])
+            for name in ("x0", "y0", "x1", "y1")
+        },
+        "title_block": (
+            {
+                name: _round_coord(title_block[name])
+                for name in ("x0", "y0", "x1", "y1")
+            }
+            if title_block is not None else None
+        ),
+        "fields": fields,
+        "line_indexes": sorted(line_indexes),
+        "rectangle_indexes": sorted(rectangle_indexes),
+        "curve_indexes": sorted(curve_indexes),
+        "text_indexes": sorted(text_indexes),
+    }
 
 
 def decode_page(page_data: dict) -> dict:
@@ -794,15 +1552,18 @@ def decode_page(page_data: dict) -> dict:
     ))
     wires = _decode_wires(page_data["lines"])
     global_labels = decode_global_labels(page_data)
+    worksheet = decode_worksheet(page_data)
     return {
         "components": components,
         "wires": wires,
         "global_labels": global_labels,
+        "worksheet": worksheet,
         "summary": {
             "components": len(components),
             "pins": sum(len(c["pins"]) for c in components),
             "wires": len(wires),
             "global_labels": len(global_labels),
+            "worksheet": worksheet is not None,
         },
     }
 

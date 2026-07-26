@@ -1,0 +1,1759 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Andrei Errapart
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Convert an OrCAD-generated schematic PDF into an editable KiCad project.
+
+The converter deliberately has two layers:
+
+* semantic objects (wires, symbols, pins, and labels) are reconstructed from
+  the color and geometry conventions decoded by :mod:`pdf_dump`;
+* PDF vectors and text which were not consumed by a semantic object are kept
+  as KiCad page graphics, preserving note pages and annotations.
+
+PDF is a presentation format, so hidden fields and pin metadata cannot always
+be recovered.  The generated project records that limitation in its title and
+uses deterministic generic symbols where the PDF does not identify a library
+part.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import re
+import sys
+import uuid
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    print(
+        "PyMuPDF not found. Install with: pip install PyMuPDF",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+import pdf_dump
+
+
+KICAD_VERSION = 20260306
+BODY_COLOR = pdf_dump.BODY_COLOR
+PIN_COLOR = pdf_dump.PIN_COLOR
+WIRE_COLOR = pdf_dump.WIRE_COLOR
+REF_RE = pdf_dump.REF_RE
+GEOM_TOL = pdf_dump.GEOM_TOL
+LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+\-\[\]<>:]*$")
+GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
+MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
+MULTI_UNIT_REF_RE = re.compile(r"^(U\d+)([A-Z])$")
+PAPER_SCALES = {
+    # Capture's standard "fit to A4" print factors.  A3 is reduced to 70%,
+    # rather than the mathematically exact sqrt(1/2), in the supplied PDFs.
+    "A0": 4.0,
+    "A1": 20.0 / 7.0,
+    "A2": 2.0,
+    "A3": 10.0 / 7.0,
+    "A4": 1.0,
+}
+PAPER_SIZES = {
+    "A0": (1189.0, 841.0),
+    "A1": (841.0, 594.0),
+    "A2": (594.0, 420.0),
+    "A3": (420.0, 297.0),
+    "A4": (297.0, 210.0),
+}
+
+
+def _esc(value) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _text_key(text: dict) -> tuple:
+    return (
+        text.get("text"),
+        text.get("x"),
+        text.get("y"),
+        text.get("x1"),
+        text.get("y1"),
+        text.get("angle"),
+    )
+
+
+def _point(line: dict, end: int) -> tuple[float, float]:
+    return (line[f"x{end}"], line[f"y{end}"])
+
+
+def _distance(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _point_close(a, b, tolerance=GEOM_TOL) -> bool:
+    return _distance(a, b) <= tolerance
+
+
+def _point_in_bbox(point, bbox: dict, margin=0.0) -> bool:
+    return (
+        bbox["x0"] - margin <= point[0] <= bbox["x1"] + margin
+        and bbox["y0"] - margin <= point[1] <= bbox["y1"] + margin
+    )
+
+
+def _bbox_for_lines(lines: list[dict]) -> dict:
+    xs = [value for line in lines for value in (line["x1"], line["x2"])]
+    ys = [value for line in lines for value in (line["y1"], line["y2"])]
+    return {"x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys)}
+
+
+def _bbox_distance(a: dict, b: dict) -> float:
+    dx = max(a["x0"] - b["x1"], b["x0"] - a["x1"], 0.0)
+    dy = max(a["y0"] - b["y1"], b["y0"] - a["y1"], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _text_bbox(text: dict) -> dict:
+    return {
+        "x0": min(text["x"], text["x1"]),
+        "y0": min(text["y"], text["y1"]),
+        "x1": max(text["x"], text["x1"]),
+        "y1": max(text["y"], text["y1"]),
+    }
+
+
+def _line_matches_pin(line: dict, pin: dict) -> bool:
+    p0, p1 = _point(line, 1), _point(line, 2)
+    hot = (pin["hot"]["x"], pin["hot"]["y"])
+    other = (pin["other"]["x"], pin["other"]["y"])
+    return (
+        _point_close(p0, hot) and _point_close(p1, other)
+    ) or (
+        _point_close(p1, hot) and _point_close(p0, other)
+    )
+
+
+def _point_to_segment(point, a, b) -> tuple[float, tuple[float, float]]:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    denom = dx * dx + dy * dy
+    if denom == 0:
+        return _distance(point, a), a
+    t = ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    nearest = (a[0] + t * dx, a[1] + t * dy)
+    return _distance(point, nearest), nearest
+
+
+def _point_on_any_wire(point, wires: list[dict], tolerance=GEOM_TOL):
+    best = None
+    for wire in wires:
+        a = (wire["start"]["x"], wire["start"]["y"])
+        b = (wire["end"]["x"], wire["end"]["y"])
+        dist, nearest = _point_to_segment(point, a, b)
+        if dist <= tolerance and (best is None or dist < best[0]):
+            best = (dist, nearest, wire)
+    return best
+
+
+def _nearest_wire_point(points, wires: list[dict], max_distance: float):
+    best = None
+    for point in points:
+        for wire in wires:
+            a = (wire["start"]["x"], wire["start"]["y"])
+            b = (wire["end"]["x"], wire["end"]["y"])
+            dist, nearest = _point_to_segment(point, a, b)
+            if dist <= max_distance and (best is None or dist < best[0]):
+                best = (dist, nearest, wire)
+    return best
+
+
+@dataclass(frozen=True)
+class CoordinateTransform:
+    paper: str
+    scale: float
+    origin: float
+
+    def value(self, coordinate: float) -> float:
+        return round((coordinate - self.origin) * self.scale, 2)
+
+    def delta(self, distance: float) -> float:
+        return round(distance * self.scale, 2)
+
+    def xy(self, x: float, y: float) -> tuple[float, float]:
+        return self.value(x), self.value(y)
+
+
+class UuidFactory:
+    def __init__(self, seed: bytes):
+        self.namespace = uuid.uuid5(
+            uuid.NAMESPACE_URL, "pdf2kicad:" + hashlib.sha256(seed).hexdigest()
+        )
+        self.index = 0
+
+    def new(self, kind="object") -> str:
+        self.index += 1
+        return str(uuid.uuid5(self.namespace, f"{kind}:{self.index}"))
+
+
+def detect_paper(pages: list[dict], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    candidates = []
+    for page in pages:
+        worksheet = (page.get("decoded") or {}).get("worksheet")
+        worksheet_size = (
+            (worksheet or {}).get("fields", {}).get("size", "").upper()
+        )
+        if worksheet_size in PAPER_SCALES:
+            candidates.append(worksheet_size)
+        for text in page["texts"]:
+            value = text.get("text", "").strip().upper()
+            if (
+                value in PAPER_SCALES
+                and text["x"] >= page["width"] * 0.65
+                and text["y"] >= page["height"] * 0.80
+            ):
+                candidates.append(value)
+    if candidates:
+        return Counter(candidates).most_common(1)[0][0]
+    return "A4"
+
+
+def coordinate_transform(paper: str) -> CoordinateTransform:
+    scale = PAPER_SCALES[paper]
+    # Capture's source grid is 2.54 mm.  Printed PDFs retain one reduced
+    # grid step as the border/origin offset.
+    return CoordinateTransform(paper, scale, 2.54 / scale)
+
+
+def sanitize_page_name(value: str) -> str:
+    """Match dsn2kicad.hs sanitizePageName."""
+    sanitized = "".join(
+        character
+        if character.isalnum() or character in "_.-"
+        else "_"
+        for character in value
+    )
+    return re.sub(r"_+", "_", sanitized).strip("_")
+
+
+def _canonical_page_heading(value: str) -> str:
+    value = re.sub(r"\s+", " ", value.strip())
+    normalized = value.casefold()
+    exact = {
+        "block diagram": "BLOCK",
+        "por control": "PWR_on_cnt",
+        "system config": "Sys_Config",
+        "soc clock": "Clock",
+        "qspi flashrom": "QSPIFlash",
+        "gpio": "SoC_GPIO",
+        "mipi dsi": "MIPI-DSI",
+        "extended gpio": "Ext_GPIO",
+    }
+    if normalized in exact:
+        return exact[normalized]
+    if re.fullmatch(r"usb2(?:\.0)?", normalized):
+        return "USB2"
+    if re.fullmatch(r"usb3(?:\.\d+)?", normalized):
+        return "USB3"
+    value = re.sub(r"\s+Sub\s+Board$", "", value, flags=re.IGNORECASE)
+    return sanitize_page_name(value)
+
+
+def _visible_page_heading(page: dict) -> str | None:
+    green_texts = [
+        text for text in page["texts"]
+        if (
+            text.get("color") == "#008000"
+            and int(round(text.get("angle", 0.0))) % 360 == 0
+            and text.get("text", "").strip()
+        )
+    ]
+    if not green_texts:
+        return None
+    largest_size = max(float(text.get("size") or 0.0) for text in green_texts)
+    if largest_size <= 0:
+        return None
+    candidates = [
+        text for text in green_texts
+        if float(text.get("size") or 0.0) >= largest_size * 0.80
+    ]
+    candidates.sort(key=lambda text: (text["y"], text["x"]))
+    values = []
+    for text in candidates:
+        value = text["text"].strip()
+        if (
+            "evaluation board" in value.casefold()
+            and len(candidates) > 1
+        ):
+            continue
+        canonical = _canonical_page_heading(value)
+        if canonical and canonical not in values:
+            values.append(canonical)
+    priority = {
+        "Clock": 0,
+        "Sys_Config": 1,
+        "PWR_on_cnt": 2,
+    }
+    values = [
+        value for _index, value in sorted(
+            enumerate(values),
+            key=lambda item: (priority.get(item[1], 100 + item[0]), item[0]),
+        )
+    ]
+    return "_".join(values) or None
+
+
+def detect_sheet_names(pages: list[dict]) -> list[str]:
+    """Reconstruct DSN-style page stream names from visible PDF headings."""
+    bases = []
+    source_numbers = []
+    source_count = len(pages)
+    for index, page in enumerate(pages, 1):
+        worksheet = (page.get("decoded") or {}).get("worksheet") or {}
+        fields = worksheet.get("fields") or {}
+        source_number = fields.get("sheet", "")
+        if source_number.isdigit():
+            page_number = int(source_number)
+        else:
+            page_number = index
+        source_numbers.append(page_number)
+        if fields.get("sheet_count", "").isdigit():
+            source_count = max(source_count, int(fields["sheet_count"]))
+
+        page_name = fields.get("page_name")
+        decoded = page.get("decoded") or {}
+        if (
+            page_number == 1
+            and not decoded.get("wires")
+            and not decoded.get("components")
+        ):
+            base = "NOTE"
+        elif page_name:
+            base = sanitize_page_name(page_name)
+            if re.match(r"^\d+[_-]", base):
+                base = re.sub(r"^\d+[_-]", "", base)
+        else:
+            base = _visible_page_heading(page)
+        if not base:
+            base = "NOTE" if page_number == 1 else "Page"
+        bases.append(base)
+
+    totals = Counter(bases)
+    occurrences = Counter()
+    width = max(2, len(str(source_count)))
+    names = []
+    for page_number, base in zip(source_numbers, bases):
+        occurrences[base] += 1
+        if totals[base] > 1 and base != "Page":
+            base = f"{base}{occurrences[base]}"
+        names.append(
+            sanitize_page_name(f"{page_number:0{width}d}_{base}")
+        )
+    return names
+
+
+def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
+    records = [
+        (index, line)
+        for index, line in enumerate(page["lines"])
+        if (
+            index not in excluded_indexes
+            and line.get("color") in (BODY_COLOR, PIN_COLOR)
+            and pdf_dump._line_length(line) >= GEOM_TOL
+        )
+    ]
+    if not records:
+        return []
+
+    parent = list(range(len(records)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        first, second = find(first), find(second)
+        if first != second:
+            parent[second] = first
+
+    endpoints: dict[tuple[int, int], list[int]] = {}
+    tolerance = 0.06
+    for record_index, (_line_index, line) in enumerate(records):
+        for x, y in (_point(line, 1), _point(line, 2)):
+            key = (round(x / tolerance), round(y / tolerance))
+            for other in endpoints.get(key, []):
+                union(record_index, other)
+            endpoints.setdefault(key, []).append(record_index)
+
+    grouped: dict[int, list[tuple[int, dict]]] = {}
+    for record_index, record in enumerate(records):
+        grouped.setdefault(find(record_index), []).append(record)
+
+    clusters = []
+    for entries in grouped.values():
+        body = [line for _index, line in entries if line["color"] == BODY_COLOR]
+        pins = [line for _index, line in entries if line["color"] == PIN_COLOR]
+        if not body or not pins:
+            continue
+        clusters.append(
+            {
+                "entries": entries,
+                "body_lines": body,
+                "pin_lines": pins,
+                "bbox": _bbox_for_lines(body),
+            }
+        )
+
+    # Capacitor plates are two disconnected body/pin components.  Merge only
+    # close one-pin halves; adjacent resistor networks are farther apart.
+    changed = True
+    while changed:
+        changed = False
+        for first_index in range(len(clusters)):
+            first = clusters[first_index]
+            if len(first["pin_lines"]) != 1:
+                continue
+            for second_index in range(first_index + 1, len(clusters)):
+                second = clusters[second_index]
+                if len(second["pin_lines"]) != 1:
+                    continue
+                if _bbox_distance(first["bbox"], second["bbox"]) > 0.75:
+                    continue
+                merged_entries = first["entries"] + second["entries"]
+                merged_body = first["body_lines"] + second["body_lines"]
+                merged_pins = first["pin_lines"] + second["pin_lines"]
+                clusters[first_index] = {
+                    "entries": merged_entries,
+                    "body_lines": merged_body,
+                    "pin_lines": merged_pins,
+                    "bbox": _bbox_for_lines(merged_body),
+                }
+                del clusters[second_index]
+                changed = True
+                break
+            if changed:
+                break
+    return clusters
+
+
+def _pins_from_cluster(cluster: dict) -> list[dict]:
+    bbox = cluster["bbox"]
+    center = ((bbox["x0"] + bbox["x1"]) / 2, (bbox["y0"] + bbox["y1"]) / 2)
+    pins = []
+    for line in cluster["pin_lines"]:
+        first, second = _point(line, 1), _point(line, 2)
+        if _distance(first, center) >= _distance(second, center):
+            hot, other = first, second
+        else:
+            hot, other = second, first
+        pins.append(
+            {
+                "hot": {"x": hot[0], "y": hot[1]},
+                "other": {"x": other[0], "y": other[1]},
+                "length": round(_distance(hot, other), 3),
+            }
+        )
+    pins.sort(key=lambda pin: (pin["hot"]["y"], pin["hot"]["x"]))
+    for number, pin in enumerate(pins, 1):
+        pin["number"] = str(number)
+    return pins
+
+
+def _assign_missing_pin_numbers(pins: list[dict]) -> None:
+    used = {str(pin["number"]) for pin in pins if pin.get("number")}
+    next_number = 1
+    for pin in sorted(
+        pins, key=lambda item: (item["hot"]["y"], item["hot"]["x"])
+    ):
+        if pin.get("number"):
+            continue
+        while str(next_number) in used:
+            next_number += 1
+        pin["number"] = str(next_number)
+        used.add(str(next_number))
+        next_number += 1
+
+
+def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
+    decoded = page.get("decoded") or pdf_dump.decode_page(page)
+    wires = decoded["wires"]
+    known = copy.deepcopy(decoded["components"])
+    used_texts: set[tuple] = set()
+    used_line_indexes: set[int] = set()
+
+    for component in known:
+        reference_text = component.get("reference_text")
+        if reference_text:
+            used_texts.add(_text_key(reference_text))
+        bbox = component["bbox"]
+        body_lines = []
+        component_line_indexes = set()
+        for index, line in enumerate(page["lines"]):
+            if line.get("color") == BODY_COLOR and (
+                _point_in_bbox(_point(line, 1), bbox, GEOM_TOL)
+                and _point_in_bbox(_point(line, 2), bbox, GEOM_TOL)
+            ):
+                body_lines.append(line)
+                component_line_indexes.add(index)
+            elif line.get("color") == PIN_COLOR and any(
+                _line_matches_pin(line, pin) for pin in component["pins"]
+            ):
+                component_line_indexes.add(index)
+        for pin in component["pins"]:
+            for key in ("number_text", "name_text"):
+                if pin.get(key):
+                    used_texts.add(_text_key(pin[key]))
+        _assign_missing_pin_numbers(component["pins"])
+        component["body_lines"] = body_lines
+        component["line_indexes"] = component_line_indexes
+        used_line_indexes.update(component_line_indexes)
+
+    clusters = _geometry_clusters(page, used_line_indexes)
+    reference_texts = [
+        text
+        for text in page["texts"]
+        if text.get("color") == "#000000"
+        and REF_RE.match(text.get("text", "").strip())
+        and _text_key(text) not in {
+            _text_key(component["reference_text"])
+            for component in known
+            if component.get("reference_text")
+        }
+    ]
+
+    # Associate references and geometric clusters globally so dense R/C banks
+    # cannot consume a neighbour's symbol just because of input ordering.
+    pair_scores = []
+    for cluster_index, cluster in enumerate(clusters):
+        for text_index, text in enumerate(reference_texts):
+            distance = _bbox_distance(cluster["bbox"], _text_bbox(text))
+            if distance <= 6.0:
+                pair_scores.append((distance, cluster_index, text_index))
+    paired_clusters = set()
+    paired_texts = set()
+    for _score, cluster_index, text_index in sorted(pair_scores):
+        if cluster_index in paired_clusters or text_index in paired_texts:
+            continue
+        cluster = clusters[cluster_index]
+        text = reference_texts[text_index]
+        pins = _pins_from_cluster(cluster)
+        component_line_indexes = {index for index, _line in cluster["entries"]}
+        known.append(
+            {
+                "reference": text["text"],
+                "reference_text": text,
+                "bbox": cluster["bbox"],
+                "pins": pins,
+                "body_lines": cluster["body_lines"],
+                "line_indexes": component_line_indexes,
+            }
+        )
+        used_texts.add(_text_key(text))
+        used_line_indexes.update(component_line_indexes)
+        paired_clusters.add(cluster_index)
+        paired_texts.add(text_index)
+
+    # Mechanical screw/spacer symbols may have no electrically colored pin.
+    for text_index, text in enumerate(reference_texts):
+        if text_index in paired_texts:
+            continue
+        if not MECHANICAL_REF_RE.match(text["text"]):
+            continue
+        pins = []
+        bbox = _text_bbox(text)
+        if text["text"].startswith("SP"):
+            points = [
+                (bbox["x0"], bbox["y0"]),
+                (bbox["x0"], bbox["y1"]),
+                (bbox["x1"], bbox["y0"]),
+                (bbox["x1"], bbox["y1"]),
+            ]
+            wire_hit = _nearest_wire_point(points, wires, 8.0)
+            if wire_hit:
+                hot = wire_hit[1]
+                pins = [{
+                    "hot": {"x": hot[0], "y": hot[1]},
+                    "other": {"x": hot[0], "y": hot[1]},
+                    "length": 0.0,
+                    "number": "1",
+                }]
+                bbox = {
+                    "x0": hot[0] - 1.0,
+                    "y0": hot[1] - 1.0,
+                    "x1": hot[0] + 1.0,
+                    "y1": hot[1] + 1.0,
+                }
+        known.append(
+            {
+                "reference": text["text"],
+                "reference_text": text,
+                "bbox": bbox,
+                "pins": pins,
+                "body_lines": [],
+                "line_indexes": set(),
+            }
+        )
+        used_texts.add(_text_key(text))
+
+    # Keep references which the PDF exposes but whose glyph did not use the
+    # standard body/pin colors (mounting holes and a few vendor-library
+    # symbols do this).  Pin-like text already consumed by a decoded symbol is
+    # excluded.  Requiring a schematic page with wires avoids interpreting the
+    # block-diagram note page's Uxx annotations as components.
+    if wires:
+        for text in reference_texts:
+            if _text_key(text) in used_texts:
+                continue
+            bbox = _text_bbox(text)
+            pins = []
+            if text["text"].startswith("TP"):
+                points = [
+                    (bbox["x0"], bbox["y0"]),
+                    (bbox["x0"], bbox["y1"]),
+                    (bbox["x1"], bbox["y0"]),
+                    (bbox["x1"], bbox["y1"]),
+                ]
+                wire_hit = _nearest_wire_point(points, wires, 5.0)
+                if wire_hit:
+                    hot = wire_hit[1]
+                    pins = [{
+                        "hot": {"x": hot[0], "y": hot[1]},
+                        "other": {"x": hot[0], "y": hot[1]},
+                        "length": 0.0,
+                        "number": "1",
+                    }]
+                    bbox = {
+                        "x0": hot[0] - 1.0,
+                        "y0": hot[1] - 1.0,
+                        "x1": hot[0] + 1.0,
+                        "y1": hot[1] + 1.0,
+                    }
+            known.append({
+                "reference": text["text"],
+                "reference_text": text,
+                "bbox": bbox,
+                "pins": pins,
+                "body_lines": [],
+                "line_indexes": set(),
+            })
+            used_texts.add(_text_key(text))
+
+    known = [component for component in known if component.get("reference")]
+    known.sort(
+        key=lambda component: (
+            component["reference"],
+            component["bbox"]["y0"],
+            component["bbox"]["x0"],
+        )
+    )
+    return known, used_texts, used_line_indexes
+
+
+def _default_value(reference: str) -> str:
+    match = re.match(r"([A-Za-z]+)", reference)
+    return match.group(1) if match else "PDF_COMPONENT"
+
+
+def assign_values(
+    page: dict, components: list[dict], consumed_texts: set[tuple]
+) -> None:
+    for component in components:
+        reference_text = component.get("reference_text")
+        component["value"] = _default_value(component["reference"])
+        if not reference_text:
+            continue
+        candidates = []
+        for text in page["texts"]:
+            key = _text_key(text)
+            if key in consumed_texts:
+                continue
+            value = text.get("text", "").strip()
+            if (
+                not value
+                or text.get("color") != "#000000"
+                or REF_RE.match(value)
+                or int(round(text.get("angle", 0))) % 180
+                != int(round(reference_text.get("angle", 0))) % 180
+            ):
+                continue
+            size = max(float(reference_text.get("size") or 0), 0.1)
+            if abs(float(text.get("size") or 0) - size) > size * 0.35:
+                continue
+            dx = abs(text["x"] - reference_text["x"])
+            dy = abs(text["y"] - reference_text["y"])
+            if dx <= max(0.7, size * 0.55) and 0.2 <= dy <= 25.0:
+                candidates.append((dy + dx * 5.0, text))
+        if candidates:
+            _score, value_text = min(candidates, key=lambda entry: entry[0])
+            component["value"] = value_text["text"]
+            component["value_text"] = value_text
+            consumed_texts.add(_text_key(value_text))
+
+
+def decode_power_ports(
+    page: dict, wires: list[dict], consumed_texts: set[tuple]
+) -> list[dict]:
+    ports = []
+    seen = set()
+    black_lines = [
+        line for line in page["lines"] if line.get("color") == "#000000"
+    ]
+
+    # GND is rendered as a closed triangle whose base midpoint is the wire
+    # hotpoint.  pdf_dump already identifies the two diagonal arms.
+    for chevron in pdf_dump._chevrons(page["lines"]):
+        first = page["lines"][chevron["line_indexes"][0]]
+        second = page["lines"][chevron["line_indexes"][1]]
+        if first.get("color") != "#000000" or second.get("color") != "#000000":
+            continue
+        apex = chevron["apex"]
+
+        def other_endpoint(line):
+            p0, p1 = _point(line, 1), _point(line, 2)
+            return p1 if _point_close(p0, apex, 0.13) else p0
+
+        q, r = other_endpoint(first), other_endpoint(second)
+        closed = any(
+            (
+                _point_close(_point(line, 1), q, 0.13)
+                and _point_close(_point(line, 2), r, 0.13)
+            )
+            or (
+                _point_close(_point(line, 2), q, 0.13)
+                and _point_close(_point(line, 1), r, 0.13)
+            )
+            for line in black_lines
+        )
+        if not closed:
+            continue
+        hot = ((q[0] + r[0]) / 2, (q[1] + r[1]) / 2)
+        wire_hit = _point_on_any_wire(hot, wires, 0.16)
+        if not wire_hit:
+            continue
+        hot = wire_hit[1]
+        key = ("GND", round(hot[0], 2), round(hot[1], 2))
+        if key not in seen:
+            ports.append({"name": "GND", "point": hot, "kind": "power"})
+            seen.add(key)
+
+    # Positive rails use a short T bar and perpendicular stem.  The visible
+    # power name is aligned beyond the bar, opposite the wire hotpoint.
+    for bar in black_lines:
+        bar_start, bar_end = _point(bar, 1), _point(bar, 2)
+        bar_length = _distance(bar_start, bar_end)
+        if not (0.5 <= bar_length <= 3.0):
+            continue
+        horizontal = abs(bar_start[1] - bar_end[1]) <= 0.08
+        vertical = abs(bar_start[0] - bar_end[0]) <= 0.08
+        if not (horizontal or vertical):
+            continue
+        midpoint = (
+            (bar_start[0] + bar_end[0]) / 2,
+            (bar_start[1] + bar_end[1]) / 2,
+        )
+        for stem in black_lines:
+            if stem is bar:
+                continue
+            stem_start, stem_end = _point(stem, 1), _point(stem, 2)
+            stem_length = _distance(stem_start, stem_end)
+            if not (0.4 <= stem_length <= 3.0):
+                continue
+            stem_horizontal = abs(stem_start[1] - stem_end[1]) <= 0.08
+            stem_vertical = abs(stem_start[0] - stem_end[0]) <= 0.08
+            if horizontal and not stem_vertical:
+                continue
+            if vertical and not stem_horizontal:
+                continue
+            if _point_close(stem_start, midpoint, 0.13):
+                hot = stem_end
+            elif _point_close(stem_end, midpoint, 0.13):
+                hot = stem_start
+            else:
+                continue
+            wire_hit = _point_on_any_wire(hot, wires, 0.16)
+            if not wire_hit:
+                continue
+            hot = wire_hit[1]
+            away = (midpoint[0] - hot[0], midpoint[1] - hot[1])
+            length = math.hypot(*away)
+            if length == 0:
+                continue
+            away = (away[0] / length, away[1] / length)
+            names = []
+            for text in page["texts"]:
+                if (
+                    text.get("color") != "#000000"
+                    or _text_key(text) in consumed_texts
+                    or not LABEL_RE.match(text.get("text", "").strip())
+                ):
+                    continue
+                center = (
+                    (text["x"] + text["x1"]) / 2,
+                    (text["y"] + text["y1"]) / 2,
+                )
+                offset = (center[0] - midpoint[0], center[1] - midpoint[1])
+                along = offset[0] * away[0] + offset[1] * away[1]
+                across = abs(offset[0] * away[1] - offset[1] * away[0])
+                if -0.5 <= along <= 10.0 and across <= 5.0:
+                    names.append((along + across * 2.0, text))
+            if not names:
+                continue
+            _score, text = min(names, key=lambda entry: entry[0])
+            name = text["text"].upper()
+            key = (name, round(hot[0], 2), round(hot[1], 2))
+            if key not in seen:
+                ports.append(
+                    {
+                        "name": name,
+                        "point": hot,
+                        "kind": "power",
+                        "text": text,
+                    }
+                )
+                consumed_texts.add(_text_key(text))
+                seen.add(key)
+    return ports
+
+
+def decode_global_labels(
+    page: dict,
+    wires: list[dict],
+    consumed_texts: set[tuple],
+    consumed_lines: set[int],
+) -> list[dict]:
+    # Capture prints cross-page destinations as separate red text spans beside
+    # off-page ports.  Their placement varies between Capture versions, but
+    # their syntax is unambiguous; never preserve them as residual graphics.
+    for text in page["texts"]:
+        if (
+            text.get("color") == pdf_dump.GLOBAL_LABEL_TEXT_COLOR
+            and GLOBAL_LABEL_PAGE_REFERENCE_RE.fullmatch(
+                text.get("text", "").strip()
+            )
+        ):
+            consumed_texts.add(_text_key(text))
+
+    decoded = page.get("decoded") or {}
+    if not wires and not decoded.get("components"):
+        return []
+    labels = []
+    seen = set()
+    for label in pdf_dump.decode_global_labels(page):
+        apex = (label["apex"]["x"], label["apex"]["y"])
+        base = (label["base"]["x"], label["base"]["y"])
+        hotpoint = label.get("hotpoint")
+        if hotpoint:
+            point = (hotpoint["x"], hotpoint["y"])
+        else:
+            # Backward compatibility for decoder data without a complete glyph
+            # hotpoint.
+            point = (2 * base[0] - apex[0], 2 * base[1] - apex[1])
+        hit = _nearest_wire_point([point], wires, 0.2)
+        if hit:
+            point = hit[1]
+        name = label["name"].upper()
+        key = (name, round(point[0], 2), round(point[1], 2))
+        if key in seen:
+            continue
+        angle = {
+            "right": 0,
+            "left": 180,
+            "up": 90,
+            "down": 270,
+        }[label["direction"]]
+        labels.append(
+            {
+                "name": name,
+                "point": point,
+                "kind": "global",
+                "angle": angle,
+                "direction": label["direction"],
+            }
+        )
+        seen.add(key)
+        consumed_lines.update(label.get("line_indexes", []))
+        consumed_texts.update(
+            _text_key(page_reference)
+            for page_reference in label.get("page_references", [])
+        )
+        # Find the original full text span to suppress its graphical duplicate.
+        for text in page["texts"]:
+            if (
+                text.get("text") == label["name"]
+                and abs(text["x"] - label["text"]["x"]) <= GEOM_TOL
+                and abs(text["y"] - label["text"]["y"]) <= GEOM_TOL
+            ):
+                consumed_texts.add(_text_key(text))
+                break
+    return labels
+
+
+def decode_local_labels(
+    page: dict, wires: list[dict], consumed_texts: set[tuple]
+) -> list[dict]:
+    labels = []
+    seen = set()
+    for text in page["texts"]:
+        key = _text_key(text)
+        value = text.get("text", "").strip()
+        if (
+            key in consumed_texts
+            or text.get("color") not in ("#000000", "#008000")
+            or not LABEL_RE.match(value)
+            or ("_" not in value and any(character.islower() for character in value))
+            or len(value) > 100
+        ):
+            continue
+        bbox = _text_bbox(text)
+        size = max(float(text.get("size") or 0), 0.1)
+        points = [
+            (
+                text["x"] - 0.218 * size,
+                text["y1"] + 0.160 * size,
+            )
+            if int(round(text.get("angle", 0))) % 360 == 0
+            else (
+                (bbox["x0"] + bbox["x1"]) / 2,
+                (bbox["y0"] + bbox["y1"]) / 2,
+            ),
+            (bbox["x0"], bbox["y0"]),
+            (bbox["x0"], bbox["y1"]),
+            (bbox["x1"], bbox["y0"]),
+            (bbox["x1"], bbox["y1"]),
+            ((bbox["x0"] + bbox["x1"]) / 2, bbox["y0"]),
+            ((bbox["x0"] + bbox["x1"]) / 2, bbox["y1"]),
+            (bbox["x0"], (bbox["y0"] + bbox["y1"]) / 2),
+            (bbox["x1"], (bbox["y0"] + bbox["y1"]) / 2),
+        ]
+        hit = _nearest_wire_point(points, wires, max(0.42, size * 0.30))
+        if not hit:
+            continue
+        point = hit[1]
+        name = value.upper()
+        label_key = (name, round(point[0], 2), round(point[1], 2))
+        if label_key in seen:
+            consumed_texts.add(key)
+            continue
+        labels.append(
+            {
+                "name": name,
+                "point": point,
+                "angle": int(round(text.get("angle", 0))) % 360,
+                "kind": "local",
+                "text": text,
+            }
+        )
+        consumed_texts.add(key)
+        seen.add(label_key)
+    return labels
+
+
+def decode_page(page: dict) -> dict:
+    decoded = page.get("decoded") or pdf_dump.decode_page(page)
+    wires = decoded["wires"]
+    components, consumed_texts, semantic_lines = decode_components(page)
+    assign_values(page, components, consumed_texts)
+    power_ports = decode_power_ports(page, wires, consumed_texts)
+    global_labels = decode_global_labels(
+        page,
+        wires,
+        consumed_texts,
+        semantic_lines,
+    )
+    local_labels = decode_local_labels(page, wires, consumed_texts)
+    worksheet = decoded.get("worksheet")
+    semantic_rectangles = set()
+    semantic_curves = set()
+    if worksheet:
+        semantic_lines.update(worksheet.get("line_indexes", []))
+        semantic_rectangles.update(worksheet.get("rectangle_indexes", []))
+        semantic_curves.update(worksheet.get("curve_indexes", []))
+        consumed_texts.update(
+            _text_key(page["texts"][index])
+            for index in worksheet.get("text_indexes", [])
+            if 0 <= index < len(page["texts"])
+        )
+    return {
+        "components": components,
+        "wires": wires,
+        "power_ports": power_ports,
+        "global_labels": global_labels,
+        "local_labels": local_labels,
+        "consumed_texts": consumed_texts,
+        "semantic_lines": semantic_lines,
+        "semantic_rectangles": semantic_rectangles,
+        "semantic_curves": semantic_curves,
+        "worksheet": worksheet,
+    }
+
+
+def detect_multi_units(semantics: list[dict]) -> dict[str, list[dict]]:
+    """Detect U1A, U1B, ... designators and annotate true KiCad units.
+
+    A group is accepted only when every suffix occurs exactly once, there are
+    at least two units, and the suffixes form an uninterrupted sequence
+    beginning with A.  A bare reference with the same base (for example U1)
+    makes the group ambiguous and prevents merging.
+    """
+    candidates: dict[str, dict[str, list[dict]]] = {}
+    bare_references = set()
+    for semantic in semantics:
+        for component in semantic["components"]:
+            reference = component["reference"]
+            match = MULTI_UNIT_REF_RE.fullmatch(reference)
+            if match:
+                base, suffix = match.groups()
+                candidates.setdefault(base, {}).setdefault(suffix, []).append(
+                    component
+                )
+            elif re.fullmatch(r"U\d+", reference):
+                bare_references.add(reference)
+
+    groups = {}
+    for base, suffix_map in sorted(candidates.items()):
+        if base in bare_references or any(
+            len(components) != 1 for components in suffix_map.values()
+        ):
+            continue
+        suffixes = sorted(suffix_map)
+        if len(suffixes) < 2:
+            continue
+        expected = [
+            chr(ord("A") + index)
+            for index in range(ord(suffixes[-1]) - ord("A") + 1)
+        ]
+        if suffixes != expected:
+            continue
+
+        members = []
+        for unit, suffix in enumerate(suffixes, 1):
+            component = suffix_map[suffix][0]
+            component["source_reference"] = component["reference"]
+            component["reference"] = base
+            component["unit"] = unit
+            component["multi_unit"] = base
+            component["multi_unit_count"] = len(suffixes)
+            members.append(component)
+
+        # A multi-unit KiCad symbol has one shared value.  Prefer unit A's
+        # recovered value, which is also deterministic when only the generic
+        # "U" fallback is available.
+        shared_value = members[0]["value"]
+        for component in members:
+            component["value"] = shared_value
+        groups[base] = members
+    return groups
+
+
+def _rgba(color: str | None, alpha=1) -> str:
+    if not color or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        return f"0 0 0 {alpha}"
+    return (
+        f"{int(color[1:3], 16)} {int(color[3:5], 16)} "
+        f"{int(color[5:7], 16)} {alpha}"
+    )
+
+
+def _header(
+    factory: UuidFactory,
+    paper: str,
+    title: str,
+    worksheet_fields: dict | None = None,
+) -> str:
+    fields = worksheet_fields or {}
+    title_block = [
+        "\t(title_block\n",
+        f'\t\t(title "{_esc(fields.get("title") or title)}")\n',
+    ]
+    for key, kicad_name in (
+        ("date", "date"),
+        ("revision", "rev"),
+        ("company", "company"),
+    ):
+        if fields.get(key):
+            title_block.append(
+                f'\t\t({kicad_name} "{_esc(fields[key])}")\n'
+            )
+    comments = []
+    if fields.get("document_number"):
+        comments.append(f'Document Number: {fields["document_number"]}')
+    if fields.get("page_name"):
+        comments.append(f'Page Name: {fields["page_name"]}')
+    if fields.get("sheet"):
+        source_sheet = f'Source sheet {fields["sheet"]}'
+        if fields.get("sheet_count"):
+            source_sheet += f' of {fields["sheet_count"]}'
+        comments.append(source_sheet)
+    comments.append(
+        "Reconstructed from PDF; hidden metadata may be unavailable"
+    )
+    for number, comment in enumerate(comments[:9], 1):
+        title_block.append(
+            f'\t\t(comment {number} "{_esc(comment)}")\n'
+        )
+    title_block.append("\t)\n")
+    return (
+        "(kicad_sch\n"
+        f"\t(version {KICAD_VERSION})\n"
+        '\t(generator "pdf2kicad")\n'
+        '\t(generator_version "0.1")\n'
+        f'\t(uuid "{factory.new("schematic")}")\n'
+        f'\t(paper "{paper}")\n'
+        + "".join(title_block)
+    )
+
+
+def _wire(factory, transform, wire) -> str:
+    x1, y1 = transform.xy(wire["start"]["x"], wire["start"]["y"])
+    x2, y2 = transform.xy(wire["end"]["x"], wire["end"]["y"])
+    return (
+        "\t(wire\n"
+        f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))\n"
+        "\t\t(stroke (width 0) (type default))\n"
+        f'\t\t(uuid "{factory.new("wire")}")\n'
+        "\t)\n"
+    )
+
+
+def _label(factory, transform, label) -> str:
+    x, y = transform.xy(*label["point"])
+    angle = int(label.get("angle", 0)) % 360
+    name = _esc(label["name"])
+    if label["kind"] in ("global", "power"):
+        justify = "right" if angle == 180 else "left"
+        return (
+            f'\t(global_label "{name}"\n'
+            "\t\t(shape bidirectional)\n"
+            f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
+            f"\t\t(effects (font (size 1.27 1.27)) (justify {justify}))\n"
+            f'\t\t(uuid "{factory.new("global-label")}")\n'
+            '\t\t(property "Intersheetrefs" "${INTERSHEET_REFS}"\n'
+            "\t\t\t(at 0 0 0)\n"
+            "\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n"
+            "\t\t)\n"
+            "\t)\n"
+        )
+    justify = "right bottom" if angle in (180, 270) else "left bottom"
+    return (
+        f'\t(label "{name}"\n'
+        f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
+        f"\t\t(effects (font (size 1.27 1.27)) (justify {justify}))\n"
+        f'\t\t(uuid "{factory.new("label")}")\n'
+        "\t)\n"
+    )
+
+
+def _pin_direction(pin: dict) -> int:
+    hot = pin["hot"]
+    other = pin["other"]
+    # KiCad library coordinates are Y-up while schematic/PDF coordinates are
+    # Y-down.
+    dx = other["x"] - hot["x"]
+    dy = hot["y"] - other["y"]
+    if abs(dx) >= abs(dy):
+        return 0 if dx > 0 else 180
+    return 90 if dy > 0 else 270
+
+
+def _symbol_unit_definition(
+    transform: CoordinateTransform,
+    component: dict,
+    base: str,
+    unit: int,
+    *,
+    multi_unit: bool,
+) -> str:
+    bbox = component["bbox"]
+    origin = (
+        (bbox["x0"] + bbox["x1"]) / 2,
+        (bbox["y0"] + bbox["y1"]) / 2,
+    )
+
+    def local(point):
+        return (
+            transform.delta(point[0] - origin[0]),
+            -transform.delta(point[1] - origin[1]),
+        )
+
+    body = []
+    for line in component.get("body_lines", []):
+        x1, y1 = local(_point(line, 1))
+        x2, y2 = local(_point(line, 2))
+        width = max(0.15, transform.delta(line.get("width", 0.1)))
+        body.append(
+            "\t\t\t\t(polyline\n"
+            f"\t\t\t\t\t(pts (xy {x1:.2f} {y1:.2f}) "
+            f"(xy {x2:.2f} {y2:.2f}))\n"
+            f"\t\t\t\t\t(stroke (width {width:.2f}) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+        )
+    if not body:
+        x0, y0 = local((bbox["x0"], bbox["y0"]))
+        x1, y1 = local((bbox["x1"], bbox["y1"]))
+        if abs(x1 - x0) < 0.2:
+            x0, x1 = -1.27, 1.27
+        if abs(y1 - y0) < 0.2:
+            y0, y1 = -1.27, 1.27
+        body.append(
+            "\t\t\t\t(rectangle\n"
+            f"\t\t\t\t\t(start {x0:.2f} {y0:.2f})\n"
+            f"\t\t\t\t\t(end {x1:.2f} {y1:.2f})\n"
+            "\t\t\t\t\t(stroke (width 0.15) (type default))\n"
+            "\t\t\t\t\t(fill (type background))\n"
+            "\t\t\t\t)\n"
+        )
+
+    pin_parts = []
+    for pin in component["pins"]:
+        hot = (pin["hot"]["x"], pin["hot"]["y"])
+        x, y = local(hot)
+        length = max(0.01, transform.delta(pin.get("length", 0.0)))
+        number = _esc(pin["number"])
+        name = _esc(pin.get("name") or "~")
+        electrical_type = (
+            "no_connect" if (pin.get("name") or "").upper() == "NC" else "passive"
+        )
+        pin_parts.append(
+            f"\t\t\t\t(pin {electrical_type} line\n"
+            f"\t\t\t\t\t(at {x:.2f} {y:.2f} {_pin_direction(pin)})\n"
+            f"\t\t\t\t\t(length {length:.2f})\n"
+            f'\t\t\t\t\t(name "{name}" '
+            "(effects (font (size 1.27 1.27))))\n"
+            f'\t\t\t\t\t(number "{number}" '
+            "(effects (font (size 1.27 1.27))))\n"
+            "\t\t\t\t)\n"
+        )
+
+    body_name = f"{base}_{unit}_0" if multi_unit else f"{base}_0_1"
+    return (
+        f'\t\t\t(symbol "{body_name}"\n'
+        + "".join(body)
+        + "\t\t\t)\n"
+        f'\t\t\t(symbol "{base}_{unit}_1"\n'
+        + "".join(pin_parts)
+        + "\t\t\t)\n"
+    )
+
+
+def _symbol_definition(
+    _factory: UuidFactory,
+    transform: CoordinateTransform,
+    component: dict,
+    lib_id: str,
+    units: list[tuple[int, CoordinateTransform, dict]] | None = None,
+) -> str:
+    base = lib_id.split(":", 1)[-1]
+    if units is None:
+        units = [(1, transform, component)]
+    unit_components = [unit_component for _unit, _transform, unit_component in units]
+    hide_names = "\t\t\t(pin_names (offset 1.016) hide)\n" if not any(
+        pin.get("name")
+        for unit_component in unit_components
+        for pin in unit_component["pins"]
+    ) else "\t\t\t(pin_names (offset 1.016))\n"
+    return (
+        f'\t\t(symbol "{lib_id}"\n'
+        "\t\t\t(exclude_from_sim no)\n"
+        "\t\t\t(in_bom yes)\n"
+        "\t\t\t(on_board yes)\n"
+        f"{hide_names}"
+        '\t\t\t(property "Reference" "U"\n'
+        "\t\t\t\t(at 0 -2.54 0)\n"
+        "\t\t\t\t(effects (font (size 1.27 1.27)))\n"
+        "\t\t\t)\n"
+        f'\t\t\t(property "Value" "{_esc(component["value"])}"\n'
+        "\t\t\t\t(at 0 2.54 0)\n"
+        "\t\t\t\t(effects (font (size 1.27 1.27)))\n"
+        "\t\t\t)\n"
+        + "".join(
+            _symbol_unit_definition(
+                unit_transform,
+                unit_component,
+                base,
+                unit,
+                multi_unit=len(units) > 1,
+            )
+            for unit, unit_transform, unit_component in units
+        )
+        + "\t\t)\n"
+    )
+
+
+def _component_instance(
+    factory: UuidFactory,
+    transform: CoordinateTransform,
+    component: dict,
+    lib_id: str,
+) -> str:
+    bbox = component["bbox"]
+    origin = (
+        (bbox["x0"] + bbox["x1"]) / 2,
+        (bbox["y0"] + bbox["y1"]) / 2,
+    )
+    x, y = transform.xy(*origin)
+    ref_text = component.get("reference_text")
+    if ref_text:
+        ref_at = transform.xy(
+            (ref_text["x"] + ref_text["x1"]) / 2,
+            (ref_text["y"] + ref_text["y1"]) / 2,
+        )
+        ref_angle = int(round(ref_text.get("angle", 0))) % 180
+        ref_size = max(0.8, transform.delta(ref_text.get("size") or 1.27))
+    else:
+        ref_at = (x, y - 2.54)
+        ref_angle = 0
+        ref_size = 1.27
+    value_text = component.get("value_text")
+    if value_text:
+        value_at = transform.xy(
+            (value_text["x"] + value_text["x1"]) / 2,
+            (value_text["y"] + value_text["y1"]) / 2,
+        )
+        value_angle = int(round(value_text.get("angle", 0))) % 180
+        value_size = max(0.8, transform.delta(value_text.get("size") or 1.27))
+    else:
+        value_at = (x, y + 2.54)
+        value_angle = 0
+        value_size = 1.27
+    reference = _esc(component["reference"])
+    value = _esc(component["value"])
+    unit = component.get("unit", 1)
+    parts = [
+        "\t(symbol\n",
+        f'\t\t(lib_id "{lib_id}")\n',
+        f"\t\t(at {x:.2f} {y:.2f} 0)\n",
+        f"\t\t(unit {unit})\n",
+        "\t\t(exclude_from_sim no)\n",
+        "\t\t(in_bom yes)\n",
+        "\t\t(on_board yes)\n",
+        "\t\t(dnp no)\n",
+        f'\t\t(uuid "{factory.new("symbol")}")\n',
+        f'\t\t(property "Reference" "{reference}"\n',
+        f"\t\t\t(at {ref_at[0]:.2f} {ref_at[1]:.2f} {ref_angle})\n",
+        f"\t\t\t(effects (font (size {ref_size:.2f} {ref_size:.2f})))\n",
+        "\t\t)\n",
+        f'\t\t(property "Value" "{value}"\n',
+        f"\t\t\t(at {value_at[0]:.2f} {value_at[1]:.2f} {value_angle})\n",
+        f"\t\t\t(effects (font (size {value_size:.2f} {value_size:.2f})))\n",
+        "\t\t)\n",
+    ]
+    for pin in component["pins"]:
+        parts.extend(
+            [
+                f'\t\t(pin "{_esc(pin["number"])}"\n',
+                f'\t\t\t(uuid "{factory.new("symbol-pin")}")\n',
+                "\t\t)\n",
+            ]
+        )
+    parts.extend(
+        [
+            "\t\t(instances\n",
+            '\t\t\t(project ""\n',
+            '\t\t\t\t(path "/"\n',
+            f'\t\t\t\t\t(reference "{reference}")\n',
+            f"\t\t\t\t\t(unit {unit})\n",
+            "\t\t\t\t)\n",
+            "\t\t\t)\n",
+            "\t\t)\n",
+            "\t)\n",
+        ]
+    )
+    return "".join(parts)
+
+
+def _graphic_line(factory, transform, line) -> str:
+    x1, y1 = transform.xy(line["x1"], line["y1"])
+    x2, y2 = transform.xy(line["x2"], line["y2"])
+    width = max(0.05, transform.delta(line.get("width") or 0.05))
+    return (
+        "\t(polyline\n"
+        f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))\n"
+        f"\t\t(stroke (width {width:.2f}) (type default) "
+        f"(color {_rgba(line.get('color'))}))\n"
+        f'\t\t(uuid "{factory.new("graphic-line")}")\n'
+        "\t)\n"
+    )
+
+
+def _graphic_rectangle(factory, transform, rectangle) -> str:
+    x0, y0 = transform.xy(rectangle["x0"], rectangle["y0"])
+    x1, y1 = transform.xy(rectangle["x1"], rectangle["y1"])
+    width = max(0.05, transform.delta(rectangle.get("width") or 0.05))
+    fill = rectangle.get("fill")
+    fill_part = (
+        f"(fill (type color) (color {_rgba(fill)}))"
+        if fill
+        else "(fill (type none))"
+    )
+    return (
+        "\t(rectangle\n"
+        f"\t\t(start {x0:.2f} {y0:.2f})\n"
+        f"\t\t(end {x1:.2f} {y1:.2f})\n"
+        f"\t\t(stroke (width {width:.2f}) (type default) "
+        f"(color {_rgba(rectangle.get('color'))}))\n"
+        f"\t\t{fill_part}\n"
+        f'\t\t(uuid "{factory.new("graphic-rectangle")}")\n'
+        "\t)\n"
+    )
+
+
+def _graphic_curve(factory, transform, curve) -> str:
+    points = " ".join(
+        f"(xy {transform.value(point[0]):.2f} {transform.value(point[1]):.2f})"
+        for point in curve["points"]
+    )
+    width = max(0.05, transform.delta(curve.get("width") or 0.05))
+    return (
+        "\t(polyline\n"
+        f"\t\t(pts {points})\n"
+        f"\t\t(stroke (width {width:.2f}) (type default) "
+        f"(color {_rgba(curve.get('color'))}))\n"
+        f'\t\t(uuid "{factory.new("graphic-curve")}")\n'
+        "\t)\n"
+    )
+
+
+def _graphic_text(factory, transform, text) -> str:
+    x, y = transform.xy(text["x"], text["y1"])
+    size = max(0.5, transform.delta(text.get("size") or 1.0))
+    angle = int(round(text.get("angle", 0))) % 360
+    return (
+        f'\t(text "{_esc(text["text"])}"\n'
+        "\t\t(exclude_from_sim no)\n"
+        f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
+        f"\t\t(effects (font (size {size:.2f} {size:.2f}) "
+        f"(color {_rgba(text.get('color'))})) (justify left bottom))\n"
+        f'\t\t(uuid "{factory.new("graphic-text")}")\n'
+        "\t)\n"
+    )
+
+
+def render_page(
+    factory: UuidFactory,
+    page: dict,
+    semantic: dict,
+    transform: CoordinateTransform,
+    title: str,
+    keep_graphics: bool,
+    multi_unit_groups: dict[str, list[dict]] | None = None,
+) -> str:
+    multi_unit_groups = multi_unit_groups or {}
+    worksheet_fields = (
+        (semantic.get("worksheet") or {}).get("fields") or {}
+    )
+    parts = [
+        _header(factory, transform.paper, title, worksheet_fields),
+        "\t(lib_symbols\n",
+    ]
+    lib_ids = []
+    occurrences = Counter()
+    emitted_definitions = set()
+    for component in semantic["components"]:
+        multi_unit = component.get("multi_unit")
+        if multi_unit:
+            safe_ref = re.sub(r"[^A-Za-z0-9_]+", "_", multi_unit)
+            lib_id = f"pdf2kicad:{safe_ref}_multi"
+        else:
+            occurrences[component["reference"]] += 1
+            suffix = occurrences[component["reference"]]
+            safe_ref = re.sub(r"[^A-Za-z0-9_]+", "_", component["reference"])
+            lib_id = f"pdf2kicad:{safe_ref}_{suffix}"
+        lib_ids.append(lib_id)
+        if lib_id in emitted_definitions:
+            continue
+        if multi_unit:
+            units = [
+                (member["unit"], member["_transform"], member)
+                for member in multi_unit_groups[multi_unit]
+            ]
+            parts.append(
+                _symbol_definition(
+                    factory,
+                    transform,
+                    component,
+                    lib_id,
+                    units=units,
+                )
+            )
+        else:
+            parts.append(_symbol_definition(factory, transform, component, lib_id))
+        emitted_definitions.add(lib_id)
+    parts.append("\t)\n")
+
+    for wire in semantic["wires"]:
+        parts.append(_wire(factory, transform, wire))
+    for component, lib_id in zip(semantic["components"], lib_ids):
+        parts.append(_component_instance(factory, transform, component, lib_id))
+    for label in (
+        semantic["power_ports"]
+        + semantic["global_labels"]
+        + semantic["local_labels"]
+    ):
+        parts.append(_label(factory, transform, label))
+
+    if keep_graphics:
+        for index, line in enumerate(page["lines"]):
+            if (
+                line.get("color") == WIRE_COLOR
+                or index in semantic["semantic_lines"]
+            ):
+                continue
+            parts.append(_graphic_line(factory, transform, line))
+        for index, rectangle in enumerate(page["rectangles"]):
+            if index not in semantic["semantic_rectangles"]:
+                parts.append(_graphic_rectangle(factory, transform, rectangle))
+        for index, curve in enumerate(page["curves"]):
+            if index not in semantic["semantic_curves"]:
+                parts.append(_graphic_curve(factory, transform, curve))
+        for text in page["texts"]:
+            if _text_key(text) not in semantic["consumed_texts"]:
+                parts.append(_graphic_text(factory, transform, text))
+
+    parts.append("\t(embedded_fonts no)\n)\n")
+    return "".join(parts)
+
+
+def render_root(
+    factory: UuidFactory,
+    project_name: str,
+    page_filenames: list[str],
+    page_names: list[str],
+) -> str:
+    parts = [
+        _header(factory, "A3", f"{project_name} (PDF import)"),
+        "\t(lib_symbols)\n",
+    ]
+    rows = 4
+    for index, (filename, name) in enumerate(zip(page_filenames, page_names)):
+        row, column = index % rows, index // rows
+        x, y = 15 + column * 68, 25 + row * 17
+        parts.append(
+            "\t(sheet\n"
+            f"\t\t(at {x} {y})\n"
+            "\t\t(size 60 12)\n"
+            "\t\t(exclude_from_sim no)\n"
+            "\t\t(in_bom yes)\n"
+            "\t\t(on_board yes)\n"
+            "\t\t(dnp no)\n"
+            "\t\t(fields_autoplaced yes)\n"
+            "\t\t(stroke (width 0.1524) (type solid))\n"
+            "\t\t(fill (color 0 0 0 0))\n"
+            f'\t\t(uuid "{factory.new("sheet")}")\n'
+            f'\t\t(property "Sheetname" "{_esc(name)}"\n'
+            f"\t\t\t(at {x} {y - 0.7} 0)\n"
+            "\t\t\t(show_name no)\n"
+            "\t\t\t(do_not_autoplace no)\n"
+            "\t\t\t(effects (font (size 1.27 1.27)) (justify left top))\n"
+            "\t\t)\n"
+            f'\t\t(property "Sheetfile" "{_esc(filename)}"\n'
+            f"\t\t\t(at {x} {y + 12.7} 0)\n"
+            "\t\t\t(show_name no)\n"
+            "\t\t\t(do_not_autoplace no)\n"
+            "\t\t\t(effects (font (size 1.27 1.27)) (justify left top))\n"
+            "\t\t)\n"
+            "\t)\n"
+        )
+    parts.append(
+        "\t(sheet_instances\n"
+        '\t\t(path "/" (page "1"))\n'
+        "\t)\n"
+        "\t(embedded_fonts no)\n"
+        ")\n"
+    )
+    return "".join(parts)
+
+
+def project_file(project_name: str) -> str:
+    return json.dumps(
+        {
+            "meta": {
+                "filename": f"{project_name}.kicad_pro",
+                "version": 2,
+            },
+            "schematic": {"drawing": {}, "meta": {"version": 1}},
+        },
+        indent=2,
+    ) + "\n"
+
+
+def convert_pdf(
+    pdf_path: Path,
+    *,
+    paper: str = "auto",
+    keep_graphics: bool = True,
+) -> tuple[dict[str, str], dict]:
+    pdf_bytes = pdf_path.read_bytes()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    for index in range(len(doc)):
+        pages.append(
+            {
+                "page": index + 1,
+                **pdf_dump.dump_page(doc[index], raw=False, decode=True),
+            }
+        )
+    factory = UuidFactory(pdf_bytes)
+    project_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", pdf_path.stem).strip("_")
+    project_name = project_name or "pdf_schematic"
+
+    output = {}
+    page_files = []
+    page_names = []
+    summaries = []
+    page_records = []
+    sheet_names = detect_sheet_names(pages)
+    for index, page in enumerate(pages, 1):
+        selected_paper = detect_paper([page], paper)
+        transform = coordinate_transform(selected_paper)
+        semantic = decode_page(page)
+        for component in semantic["components"]:
+            component["_transform"] = transform
+        page_records.append(
+            {
+                "index": index,
+                "page": page,
+                "paper": selected_paper,
+                "transform": transform,
+                "semantic": semantic,
+            }
+        )
+
+    multi_unit_groups = detect_multi_units(
+        [record["semantic"] for record in page_records]
+    )
+    for record in page_records:
+        index = record["index"]
+        page = record["page"]
+        selected_paper = record["paper"]
+        transform = record["transform"]
+        semantic = record["semantic"]
+        page_name = sheet_names[index - 1]
+        page_filename = f"{page_name}.kicad_sch"
+        output[page_filename] = render_page(
+            factory,
+            page,
+            semantic,
+            transform,
+            f"{page_name} (PDF import)",
+            keep_graphics,
+            multi_unit_groups,
+        )
+        page_files.append(page_filename)
+        page_names.append(page_name)
+        summaries.append(
+            {
+                "page": index,
+                "sheet_name": page_name,
+                "sheet_file": page_filename,
+                "paper": selected_paper,
+                "wires": len(semantic["wires"]),
+                "components": len(semantic["components"]),
+                "pins": sum(
+                    len(component["pins"])
+                    for component in semantic["components"]
+                ),
+                "local_labels": len(semantic["local_labels"]),
+                "global_labels": len(semantic["global_labels"]),
+                "power_ports": len(semantic["power_ports"]),
+                "worksheet": (
+                    (semantic.get("worksheet") or {}).get("fields")
+                    if semantic.get("worksheet") else None
+                ),
+            }
+        )
+
+    output[f"{project_name}.kicad_sch"] = render_root(
+        factory, project_name, page_files, page_names
+    )
+    output[f"{project_name}.kicad_pro"] = project_file(project_name)
+    papers = [page_summary["paper"] for page_summary in summaries]
+    paper_summary = papers[0] if len(set(papers)) == 1 else "mixed"
+    return output, {
+        "project": project_name,
+        "paper": paper_summary,
+        "multi_units": {
+            reference: len(members)
+            for reference, members in multi_unit_groups.items()
+        },
+        "pages": summaries,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Convert an OrCAD schematic PDF into an editable KiCad project."
+    )
+    parser.add_argument("pdf", type=Path, help="Input schematic PDF")
+    parser.add_argument(
+        "output_dir",
+        type=Path,
+        nargs="?",
+        help="Output directory (default: <PDF stem>_kicad)",
+    )
+    parser.add_argument(
+        "--paper",
+        choices=["auto", *PAPER_SCALES],
+        default="auto",
+        help="Source sheet size; auto reads the PDF title block (default: auto)",
+    )
+    parser.add_argument(
+        "--no-graphics",
+        action="store_true",
+        help="Emit semantic schematic objects only, omitting residual PDF graphics",
+    )
+    parser.add_argument(
+        "--summary-json",
+        action="store_true",
+        help="Print the conversion summary as JSON",
+    )
+    args = parser.parse_args()
+
+    if not args.pdf.is_file():
+        parser.error(f"PDF not found: {args.pdf}")
+    output_dir = args.output_dir or Path(f"{args.pdf.stem}_kicad")
+    print(f"Opening {args.pdf.name}...", file=sys.stderr)
+    output, summary = convert_pdf(
+        args.pdf,
+        paper=args.paper,
+        keep_graphics=not args.no_graphics,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename, content in output.items():
+        (output_dir / filename).write_text(content, encoding="utf-8")
+
+    if args.summary_json:
+        json.dump(summary, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(
+            f"  {summary['paper']}, {len(summary['pages'])} pages",
+            file=sys.stderr,
+        )
+        if summary["multi_units"]:
+            units = sum(summary["multi_units"].values())
+            print(
+                f"  {len(summary['multi_units'])} multi-unit components, "
+                f"{units} units",
+                file=sys.stderr,
+            )
+        for page in summary["pages"]:
+            print(
+                f"  [{page['page']:2d}] {page['wires']} wires, "
+                f"{page['components']} components, {page['pins']} pins, "
+                f"{page['local_labels']} local labels, "
+                f"{page['global_labels']} global labels, "
+                f"{page['power_ports']} power ports",
+                file=sys.stderr,
+            )
+        print(f"\nDone → {output_dir}/", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
