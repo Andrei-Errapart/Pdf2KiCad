@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PY_SCRIPT="$SCRIPT_DIR/pdf2kicad.py"
+
+if [ -n "${PDF2KICAD_VENV:-}" ]; then
+    VENV_DIR=$PDF2KICAD_VENV
+elif [ -n "${ORCAD2KICAD_VENV:-}" ]; then
+    VENV_DIR=$ORCAD2KICAD_VENV
+else
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        CACHE_ROOT=$XDG_CACHE_HOME
+    elif [ -n "${HOME:-}" ] && [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]; then
+        CACHE_ROOT="$HOME/Library/Caches"
+    elif [ -n "${HOME:-}" ]; then
+        CACHE_ROOT="$HOME/.cache"
+    else
+        CACHE_ROOT=
+    fi
+
+    if [ -n "$CACHE_ROOT" ] && mkdir -p "$CACHE_ROOT/pdf2kicad" 2>/dev/null; then
+        VENV_DIR="$CACHE_ROOT/pdf2kicad/venv"
+    else
+        TMP_ROOT=${TMPDIR:-/tmp}
+        VENV_DIR="$TMP_ROOT/pdf2kicad-venv-${USER:-user}"
+    fi
+fi
+
+if [ ! -x "$VENV_DIR/bin/python3" ]; then
+    echo "Creating PDF2KiCad virtualenv at $VENV_DIR" >&2
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/python3" -m pip install --quiet --upgrade pip
+    "$VENV_DIR/bin/python3" -m pip install --quiet pymupdf
+fi
+
+"$VENV_DIR/bin/python3" -c "import fitz" 2>/dev/null \
+    || "$VENV_DIR/bin/python3" -m pip install --quiet pymupdf
+
+exec "$VENV_DIR/bin/python3" "$PY_SCRIPT" "$@"
