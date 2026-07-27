@@ -68,3 +68,19 @@ python3 -m unittest discover -s tests -v
 
 For corpus comparisons, export both generated schematics with
 `kicad-cli sch export netlist` before comparing connectivity.
+
+## License
+
+`pdf2kicad` is licensed under **GPL-2.0-or-later** — see [LICENSE](LICENSE).
+This is the same license as the sibling `orcad2kicad` converter and is
+compatible with KiCad's own GPL-3.0-or-later application license, so the code
+can be reused or upstreamed within the KiCad ecosystem. Every source file
+carries an `SPDX-License-Identifier: GPL-2.0-or-later` header.
+
+The only runtime dependency, PyMuPDF, is installed by the wrapper rather than
+bundled here; it is dual-licensed under AGPL-3.0-or-later or an Artifex
+commercial license. The "or later" in this project's own license is what keeps
+a combined distribution possible — a recipient may take `pdf2kicad` under
+GPL-3.0, whose section 13 permits combination with AGPL-3.0 code. Anyone
+redistributing the two together must still satisfy PyMuPDF's terms, or hold a
+commercial license for it.
