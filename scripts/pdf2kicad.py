@@ -229,6 +229,14 @@ def coordinate_transform(paper: str) -> CoordinateTransform:
     return CoordinateTransform(paper, scale, 2.54 / scale)
 
 
+def has_source_worksheet(page_records: list[dict]) -> bool:
+    """Return whether any source page has a decoded worksheet frame."""
+    return any(
+        (record["semantic"].get("worksheet") or {}).get("frame")
+        for record in page_records
+    )
+
+
 def sanitize_page_name(value: str) -> str:
     """Match dsn2kicad.hs sanitizePageName."""
     sanitized = "".join(
@@ -1150,6 +1158,7 @@ def _header(
     paper: str,
     title: str,
     worksheet_fields: dict | None = None,
+    schematic_uuid: str | None = None,
 ) -> str:
     fields = worksheet_fields or {}
     title_block = [
@@ -1188,7 +1197,7 @@ def _header(
         f"\t(version {KICAD_VERSION})\n"
         '\t(generator "pdf2kicad")\n'
         '\t(generator_version "0.1")\n'
-        f'\t(uuid "{factory.new("schematic")}")\n'
+        f'\t(uuid "{schematic_uuid or factory.new("schematic")}")\n'
         f'\t(paper "{paper}")\n'
         + "".join(title_block)
     )
@@ -1309,7 +1318,13 @@ def _power_symbol_definition(power: dict) -> str:
     )
 
 
-def _power_symbol_instance(factory, transform, power: dict) -> str:
+def _power_symbol_instance(
+    factory,
+    transform,
+    power: dict,
+    project_name: str = "",
+    instance_path: str = "/",
+) -> str:
     x, y = transform.xy(*power["point"])
     angle = int(power.get("angle", 0)) % 360
     name = _esc(power["name"])
@@ -1346,8 +1361,8 @@ def _power_symbol_instance(factory, transform, power: dict) -> str:
         "\t\t)\n"
         f'\t\t(pin "1" (uuid "{factory.new("power-pin")}"))\n'
         "\t\t(instances\n"
-        '\t\t\t(project ""\n'
-        "\t\t\t\t(path \"/\"\n"
+        f'\t\t\t(project "{_esc(project_name)}"\n'
+        f'\t\t\t\t(path "{_esc(instance_path)}"\n'
         f'\t\t\t\t\t(reference "{reference}")\n'
         "\t\t\t\t\t(unit 1)\n"
         "\t\t\t\t)\n"
@@ -1499,6 +1514,8 @@ def _component_instance(
     transform: CoordinateTransform,
     component: dict,
     lib_id: str,
+    project_name: str = "",
+    instance_path: str = "/",
 ) -> str:
     bbox = component["bbox"]
     origin = (
@@ -1563,8 +1580,8 @@ def _component_instance(
     parts.extend(
         [
             "\t\t(instances\n",
-            '\t\t\t(project ""\n',
-            '\t\t\t\t(path "/"\n',
+            f'\t\t\t(project "{_esc(project_name)}"\n',
+            f'\t\t\t\t(path "{_esc(instance_path)}"\n',
             f'\t\t\t\t\t(reference "{reference}")\n',
             f"\t\t\t\t\t(unit {unit})\n",
             "\t\t\t\t)\n",
@@ -1651,6 +1668,9 @@ def render_page(
     title: str,
     keep_graphics: bool,
     multi_unit_groups: dict[str, list[dict]] | None = None,
+    *,
+    project_name: str = "",
+    instance_path: str = "/",
 ) -> str:
     multi_unit_groups = multi_unit_groups or {}
     worksheet_fields = (
@@ -1704,9 +1724,26 @@ def render_page(
     for wire in semantic["wires"]:
         parts.append(_wire(factory, transform, wire))
     for component, lib_id in zip(semantic["components"], lib_ids):
-        parts.append(_component_instance(factory, transform, component, lib_id))
+        parts.append(
+            _component_instance(
+                factory,
+                transform,
+                component,
+                lib_id,
+                project_name,
+                instance_path,
+            )
+        )
     for power in semantic["power_ports"]:
-        parts.append(_power_symbol_instance(factory, transform, power))
+        parts.append(
+            _power_symbol_instance(
+                factory,
+                transform,
+                power,
+                project_name,
+                instance_path,
+            )
+        )
     for label in semantic["global_labels"] + semantic["local_labels"]:
         parts.append(_label(factory, transform, label))
 
@@ -1737,13 +1774,22 @@ def render_root(
     project_name: str,
     page_filenames: list[str],
     page_names: list[str],
+    root_uuid: str,
+    sheet_uuids: list[str],
 ) -> str:
     parts = [
-        _header(factory, "A3", f"{project_name} (PDF import)"),
+        _header(
+            factory,
+            "A3",
+            f"{project_name} (PDF import)",
+            schematic_uuid=root_uuid,
+        ),
         "\t(lib_symbols)\n",
     ]
     rows = 4
-    for index, (filename, name) in enumerate(zip(page_filenames, page_names)):
+    for index, (filename, name, sheet_uuid) in enumerate(
+        zip(page_filenames, page_names, sheet_uuids)
+    ):
         row, column = index % rows, index // rows
         x, y = 15 + column * 68, 25 + row * 17
         parts.append(
@@ -1757,7 +1803,7 @@ def render_root(
             "\t\t(fields_autoplaced yes)\n"
             "\t\t(stroke (width 0.1524) (type solid))\n"
             "\t\t(fill (color 0 0 0 0))\n"
-            f'\t\t(uuid "{factory.new("sheet")}")\n'
+            f'\t\t(uuid "{sheet_uuid}")\n'
             f'\t\t(property "Sheetname" "{_esc(name)}"\n'
             f"\t\t\t(at {x} {y - 0.7} 0)\n"
             "\t\t\t(show_name no)\n"
@@ -1769,6 +1815,13 @@ def render_root(
             "\t\t\t(show_name no)\n"
             "\t\t\t(do_not_autoplace no)\n"
             "\t\t\t(effects (font (size 1.27 1.27)) (justify left top))\n"
+            "\t\t)\n"
+            "\t\t(instances\n"
+            f'\t\t\t(project "{_esc(project_name)}"\n'
+            f'\t\t\t\t(path "/{root_uuid}"\n'
+            f'\t\t\t\t\t(page "{index + 2}")\n'
+            "\t\t\t\t)\n"
+            "\t\t\t)\n"
             "\t\t)\n"
             "\t)\n"
         )
@@ -1782,14 +1835,76 @@ def render_root(
     return "".join(parts)
 
 
-def project_file(project_name: str) -> str:
+def generate_worksheet() -> str:
+    """Render KiCad's default worksheet with its margins moved to the edges."""
+    return (
+        "(page_layout\n"
+        "    (setup (textsize 1.5 1.5) (linewidth 0.15) "
+        "(textlinewidth 0.15)\n"
+        "      (left_margin 0) (right_margin 0) "
+        "(top_margin 0) (bottom_margin 0))\n"
+        "    (rect (comment \"rect around the title block\") "
+        "(linewidth 0.15) (start 110 34) (end 2 2))\n"
+        "    (rect (start 0 0 ltcorner) (end 0 0 rbcorner) "
+        "(repeat 2) (incrx 2) (incry 2))\n"
+        "    (line (start 50 2 ltcorner) (end 50 0 ltcorner) "
+        "(repeat 30) (incrx 50))\n"
+        "    (tbtext \"1\" (pos 25 1 ltcorner) "
+        "(font (size 1.3 1.3)) (repeat 100) (incrx 50))\n"
+        "    (line (start 50 2 lbcorner) (end 50 0 lbcorner) "
+        "(repeat 30) (incrx 50))\n"
+        "    (tbtext \"1\" (pos 25 1 lbcorner) "
+        "(font (size 1.3 1.3)) (repeat 100) (incrx 50))\n"
+        "    (line (start 0 50 ltcorner) (end 2 50 ltcorner) "
+        "(repeat 30) (incry 50))\n"
+        "    (tbtext \"A\" (pos 1 25 ltcorner) "
+        "(font (size 1.3 1.3)) (justify center) "
+        "(repeat 100) (incry 50))\n"
+        "    (line (start 0 50 rtcorner) (end 2 50 rtcorner) "
+        "(repeat 30) (incry 50))\n"
+        "    (tbtext \"A\" (pos 1 25 rtcorner) "
+        "(font (size 1.3 1.3)) (justify center) "
+        "(repeat 100) (incry 50))\n"
+        "    (tbtext \"Date: %D\" (pos 87 6.9))\n"
+        "    (line (start 110 5.5) (end 2 5.5))\n"
+        "    (tbtext \"%K\" (pos 109 4.1) "
+        "(comment \"KiCad version\"))\n"
+        "    (line (start 110 8.5) (end 2 8.5))\n"
+        "    (tbtext \"Rev: %R\" (pos 24 6.9) "
+        "(font bold) (justify left))\n"
+        "    (tbtext \"Size: %Z\" (comment \"Paper format name\") "
+        "(pos 109 6.9))\n"
+        "    (tbtext \"Id: %S/%N\" (comment \"Sheet id\") "
+        "(pos 24 4.1))\n"
+        "    (line (start 110 12.5) (end 2 12.5))\n"
+        "    (tbtext \"Title: %T\" (pos 109 10.7) "
+        "(font bold italic (size 2 2)))\n"
+        "    (tbtext \"File: %F\" (pos 109 14.3))\n"
+        "    (line (start 110 18.5) (end 2 18.5))\n"
+        "    (tbtext \"Sheet: %P\" (pos 109 17))\n"
+        "    (tbtext \"%Y\" (comment \"Company name\") "
+        "(pos 109 20) (font bold))\n"
+        "    (tbtext \"%C0\" (comment \"Comment 0\") (pos 109 23))\n"
+        "    (tbtext \"%C1\" (comment \"Comment 1\") (pos 109 26))\n"
+        "    (tbtext \"%C2\" (comment \"Comment 2\") (pos 109 29))\n"
+        "    (tbtext \"%C3\" (comment \"Comment 3\") (pos 109 32))\n"
+        "    (line (start 90 8.5) (end 90 5.5))\n"
+        "    (line (start 26 8.5) (end 26 2))\n"
+        ")\n"
+    )
+
+
+def project_file(project_name: str, worksheet_name: str | None = None) -> str:
+    schematic = {"drawing": {}, "meta": {"version": 1}}
+    if worksheet_name:
+        schematic["page_layout_descr_file"] = worksheet_name
     return json.dumps(
         {
             "meta": {
                 "filename": f"{project_name}.kicad_pro",
-                "version": 2,
+                "version": 3,
             },
-            "schematic": {"drawing": {}, "meta": {"version": 1}},
+            "schematic": schematic,
         },
         indent=2,
     ) + "\n"
@@ -1840,6 +1955,12 @@ def convert_pdf(
     multi_unit_groups = detect_multi_units(
         [record["semantic"] for record in page_records]
     )
+    source_has_worksheet = has_source_worksheet(page_records)
+    root_uuid = factory.new("schematic")
+    sheet_uuids = [
+        factory.new("sheet")
+        for _record in page_records
+    ]
     power_number = 1
     for record in page_records:
         for power in record["semantic"]["power_ports"]:
@@ -1861,6 +1982,8 @@ def convert_pdf(
             f"{page_name} (PDF import)",
             keep_graphics,
             multi_unit_groups,
+            project_name=project_name,
+            instance_path=f"/{root_uuid}/{sheet_uuids[index - 1]}",
         )
         page_files.append(page_filename)
         page_names.append(page_name)
@@ -1887,9 +2010,21 @@ def convert_pdf(
         )
 
     output[f"{project_name}.kicad_sch"] = render_root(
-        factory, project_name, page_files, page_names
+        factory,
+        project_name,
+        page_files,
+        page_names,
+        root_uuid,
+        sheet_uuids,
     )
-    output[f"{project_name}.kicad_pro"] = project_file(project_name)
+    worksheet_name = None
+    if source_has_worksheet:
+        worksheet_name = f"{project_name}.kicad_wks"
+        output[worksheet_name] = generate_worksheet()
+    output[f"{project_name}.kicad_pro"] = project_file(
+        project_name,
+        worksheet_name,
+    )
     papers = [page_summary["paper"] for page_summary in summaries]
     paper_summary = papers[0] if len(set(papers)) == 1 else "mixed"
     return output, {

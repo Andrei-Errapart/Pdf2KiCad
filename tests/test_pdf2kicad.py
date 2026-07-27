@@ -152,6 +152,76 @@ class WorksheetTests(unittest.TestCase):
             "width": 0.1,
         }
 
+    @staticmethod
+    def page_record(paper, frame, title_block):
+        return {
+            "transform": pdf2kicad.coordinate_transform(paper),
+            "semantic": {
+                "worksheet": {
+                    "frame": frame,
+                    "title_block": title_block,
+                },
+            },
+        }
+
+    def test_source_worksheet_generates_default_kicad_style_at_page_edge(self):
+        records = [
+            self.page_record(
+                "A2",
+                {"x0": 1.27, "y0": 1.27, "x1": 295.656, "y1": 208.661},
+                {
+                    "x0": 249.936,
+                    "y0": 197.231,
+                    "x1": 295.656,
+                    "y1": 208.661,
+                },
+            ),
+            self.page_record(
+                "A3",
+                {"x0": 1.778, "y0": 1.778, "x1": 292.142, "y1": 206.079},
+                {
+                    "x0": 228.134,
+                    "y0": 190.077,
+                    "x1": 292.142,
+                    "y1": 206.079,
+                },
+            ),
+        ]
+
+        self.assertTrue(pdf2kicad.has_source_worksheet(records))
+        worksheet = pdf2kicad.generate_worksheet()
+        self.assertIn(
+            "(left_margin 0) (right_margin 0) "
+            "(top_margin 0) (bottom_margin 0)",
+            worksheet,
+        )
+        self.assertIn(
+            "(start 0 0 ltcorner) (end 0 0 rbcorner)",
+            worksheet,
+        )
+        self.assertIn("(start 110 34) (end 2 2)", worksheet)
+        self.assertIn("(repeat 100)", worksheet)
+        for field in (
+            "Date: %D",
+            "Rev: %R",
+            "Size: %Z",
+            "Id: %S/%N",
+            "Title: %T",
+            "File: %F",
+            "Sheet: %P",
+            "%Y",
+            "%C0",
+            "%C3",
+        ):
+            self.assertIn(field, worksheet)
+
+    def test_pages_without_source_worksheet_do_not_generate_one(self):
+        records = [{
+            "transform": pdf2kicad.coordinate_transform("A4"),
+            "semantic": {"worksheet": None},
+        }]
+        self.assertFalse(pdf2kicad.has_source_worksheet(records))
+
     def test_variable_cell_worksheet_is_parsed_and_consumed(self):
         page = {
             "width": 100.0,
@@ -341,6 +411,38 @@ class SemanticRecoveryTests(unittest.TestCase):
     def test_project_file_is_valid_json(self):
         project = json.loads(pdf2kicad.project_file("example"))
         self.assertEqual(project["meta"]["filename"], "example.kicad_pro")
+        self.assertEqual(project["meta"]["version"], 3)
+        self.assertNotIn(
+            "page_layout_descr_file",
+            project["schematic"],
+        )
+
+    def test_project_file_references_generated_worksheet(self):
+        project = json.loads(
+            pdf2kicad.project_file("example", "example.kicad_wks")
+        )
+        self.assertEqual(
+            project["schematic"]["page_layout_descr_file"],
+            "example.kicad_wks",
+        )
+
+    def test_root_sheets_have_complete_project_instances(self):
+        root = pdf2kicad.render_root(
+            pdf2kicad.UuidFactory(b"root"),
+            "example",
+            ["01_A.kicad_sch", "02_B.kicad_sch"],
+            ["01_A", "02_B"],
+            "root-uuid",
+            ["sheet-a", "sheet-b"],
+        )
+
+        self.assertIn('(uuid "root-uuid")', root)
+        self.assertIn('(uuid "sheet-a")', root)
+        self.assertIn('(uuid "sheet-b")', root)
+        self.assertEqual(root.count('(project "example"'), 2)
+        self.assertEqual(root.count('(path "/root-uuid"'), 2)
+        self.assertIn('(page "2")', root)
+        self.assertIn('(page "3")', root)
 
 
 class MultiUnitTests(unittest.TestCase):
@@ -408,6 +510,8 @@ class MultiUnitTests(unittest.TestCase):
             transform,
             unit_a,
             "pdf2kicad:U7_multi",
+            "example",
+            "/root/sheet",
         )
         placement_b = pdf2kicad._component_instance(
             pdf2kicad.UuidFactory(b"unit-b"),
@@ -422,6 +526,8 @@ class MultiUnitTests(unittest.TestCase):
         self.assertIn('(symbol "U7_multi_2_1"', definition)
         self.assertIn('(property "Reference" "U7"', placement_a)
         self.assertIn("\t\t(unit 1)\n", placement_a)
+        self.assertIn('(project "example"', placement_a)
+        self.assertIn('(path "/root/sheet"', placement_a)
         self.assertIn('(property "Reference" "U7"', placement_b)
         self.assertIn("\t\t(unit 2)\n", placement_b)
 
@@ -475,12 +581,16 @@ class PowerSymbolTests(unittest.TestCase):
             pdf2kicad.UuidFactory(b"supply"),
             pdf2kicad.coordinate_transform("A4"),
             ports[0],
+            "example",
+            "/root/sheet",
         )
         self.assertIn('(symbol "power:VDD_CORE"', definition)
         self.assertIn("(power)", definition)
         self.assertIn("(pin power_in line", definition)
         self.assertIn('(lib_id "power:VDD_CORE")', placement)
         self.assertIn('(reference "#PWR0001")', placement)
+        self.assertIn('(project "example"', placement)
+        self.assertIn('(path "/root/sheet"', placement)
         self.assertNotIn("(global_label", placement)
 
         rendered = pdf2kicad.render_page(
