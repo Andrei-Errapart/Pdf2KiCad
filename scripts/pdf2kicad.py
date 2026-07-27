@@ -697,17 +697,34 @@ def assign_values(
 
 
 def decode_power_ports(
-    page: dict, wires: list[dict], consumed_texts: set[tuple]
+    page: dict,
+    wires: list[dict],
+    consumed_texts: set[tuple],
+    consumed_lines: set[int],
 ) -> list[dict]:
+    decoded = page.get("decoded") or {}
+    if not wires and not decoded.get("components"):
+        return []
+
     ports = []
     seen = set()
+    worksheet_line_indexes = set(
+        ((decoded.get("worksheet") or {}).get("line_indexes") or [])
+    )
     black_lines = [
-        line for line in page["lines"] if line.get("color") == "#000000"
+        (index, line)
+        for index, line in enumerate(page["lines"])
+        if (
+            line.get("color") == "#000000"
+            and index not in worksheet_line_indexes
+        )
     ]
 
     # GND is rendered as a closed triangle whose base midpoint is the wire
     # hotpoint.  pdf_dump already identifies the two diagonal arms.
     for chevron in pdf_dump._chevrons(page["lines"]):
+        if worksheet_line_indexes.intersection(chevron["line_indexes"]):
+            continue
         first = page["lines"][chevron["line_indexes"][0]]
         second = page["lines"][chevron["line_indexes"][1]]
         if first.get("color") != "#000000" or second.get("color") != "#000000":
@@ -719,32 +736,82 @@ def decode_power_ports(
             return p1 if _point_close(p0, apex, 0.13) else p0
 
         q, r = other_endpoint(first), other_endpoint(second)
-        closed = any(
-            (
-                _point_close(_point(line, 1), q, 0.13)
-                and _point_close(_point(line, 2), r, 0.13)
+        base_indexes = [
+            index
+            for index, line in black_lines
+            if (
+                (
+                    _point_close(_point(line, 1), q, 0.13)
+                    and _point_close(_point(line, 2), r, 0.13)
+                )
+                or (
+                    _point_close(_point(line, 2), q, 0.13)
+                    and _point_close(_point(line, 1), r, 0.13)
+                )
             )
-            or (
-                _point_close(_point(line, 2), q, 0.13)
-                and _point_close(_point(line, 1), r, 0.13)
-            )
-            for line in black_lines
-        )
-        if not closed:
+        ]
+        if not base_indexes:
             continue
         hot = ((q[0] + r[0]) / 2, (q[1] + r[1]) / 2)
         wire_hit = _point_on_any_wire(hot, wires, 0.16)
-        if not wire_hit:
+        if wire_hit:
+            hot = wire_hit[1]
+        away = (apex[0] - hot[0], apex[1] - hot[1])
+        length = math.hypot(*away)
+        if length == 0:
             continue
-        hot = wire_hit[1]
-        key = ("GND", round(hot[0], 2), round(hot[1], 2))
+        away = (away[0] / length, away[1] / length)
+        names = []
+        for text in page["texts"]:
+            value = text.get("text", "").strip()
+            if (
+                text.get("color") != "#000000"
+                or _text_key(text) in consumed_texts
+                or not LABEL_RE.fullmatch(value)
+                or REF_RE.fullmatch(value)
+                or any(character.islower() for character in value)
+                or re.search(r"(?:GND|VSS)", value) is None
+            ):
+                continue
+            center = (
+                (text["x"] + text["x1"]) / 2,
+                (text["y"] + text["y1"]) / 2,
+            )
+            offset = (center[0] - hot[0], center[1] - hot[1])
+            along = offset[0] * away[0] + offset[1] * away[1]
+            across = abs(offset[0] * away[1] - offset[1] * away[0])
+            if 0.5 <= along <= 6.0 and across <= 2.5:
+                names.append((along + across * 2.0, text))
+        text = min(names, key=lambda entry: entry[0])[1] if names else None
+        name = text["text"].upper() if text else "GND"
+        key = (name, round(hot[0], 2), round(hot[1], 2))
         if key not in seen:
-            ports.append({"name": "GND", "point": hot, "kind": "power"})
+            line_indexes = sorted({
+                *chevron["line_indexes"],
+                base_indexes[0],
+            })
+            ports.append({
+                "name": name,
+                "point": hot,
+                "kind": "power",
+                "glyph": "ground",
+                "angle": {
+                    "down": 0,
+                    "right": 90,
+                    "up": 180,
+                    "left": 270,
+                }[chevron["direction"]],
+                "line_indexes": line_indexes,
+                **({"text": text} if text else {}),
+            })
+            if text:
+                consumed_texts.add(_text_key(text))
+            consumed_lines.update(line_indexes)
             seen.add(key)
 
     # Positive rails use a short T bar and perpendicular stem.  The visible
     # power name is aligned beyond the bar, opposite the wire hotpoint.
-    for bar in black_lines:
+    for bar_index, bar in black_lines:
         bar_start, bar_end = _point(bar, 1), _point(bar, 2)
         bar_length = _distance(bar_start, bar_end)
         if not (0.5 <= bar_length <= 3.0):
@@ -757,7 +824,7 @@ def decode_power_ports(
             (bar_start[0] + bar_end[0]) / 2,
             (bar_start[1] + bar_end[1]) / 2,
         )
-        for stem in black_lines:
+        for stem_index, stem in black_lines:
             if stem is bar:
                 continue
             stem_start, stem_end = _point(stem, 1), _point(stem, 2)
@@ -777,9 +844,8 @@ def decode_power_ports(
             else:
                 continue
             wire_hit = _point_on_any_wire(hot, wires, 0.16)
-            if not wire_hit:
-                continue
-            hot = wire_hit[1]
+            if wire_hit:
+                hot = wire_hit[1]
             away = (midpoint[0] - hot[0], midpoint[1] - hot[1])
             length = math.hypot(*away)
             if length == 0:
@@ -808,15 +874,29 @@ def decode_power_ports(
             name = text["text"].upper()
             key = (name, round(hot[0], 2), round(hot[1], 2))
             if key not in seen:
+                if abs(away[0]) >= abs(away[1]):
+                    direction = "right" if away[0] > 0 else "left"
+                else:
+                    direction = "down" if away[1] > 0 else "up"
+                line_indexes = sorted({bar_index, stem_index})
                 ports.append(
                     {
                         "name": name,
                         "point": hot,
                         "kind": "power",
+                        "glyph": "supply",
+                        "angle": {
+                            "up": 0,
+                            "left": 90,
+                            "down": 180,
+                            "right": 270,
+                        }[direction],
                         "text": text,
+                        "line_indexes": line_indexes,
                     }
                 )
                 consumed_texts.add(_text_key(text))
+                consumed_lines.update(line_indexes)
                 seen.add(key)
     return ports
 
@@ -958,8 +1038,13 @@ def decode_page(page: dict) -> dict:
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
     wires = decoded["wires"]
     components, consumed_texts, semantic_lines = decode_components(page)
+    power_ports = decode_power_ports(
+        page,
+        wires,
+        consumed_texts,
+        semantic_lines,
+    )
     assign_values(page, components, consumed_texts)
-    power_ports = decode_power_ports(page, wires, consumed_texts)
     global_labels = decode_global_labels(
         page,
         wires,
@@ -1125,7 +1210,7 @@ def _label(factory, transform, label) -> str:
     x, y = transform.xy(*label["point"])
     angle = int(label.get("angle", 0)) % 360
     name = _esc(label["name"])
-    if label["kind"] in ("global", "power"):
+    if label["kind"] == "global":
         justify = "right" if angle == 180 else "left"
         return (
             f'\t(global_label "{name}"\n'
@@ -1145,6 +1230,129 @@ def _label(factory, transform, label) -> str:
         f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
         f"\t\t(effects (font (size 1.27 1.27)) (justify {justify}))\n"
         f'\t\t(uuid "{factory.new("label")}")\n'
+        "\t)\n"
+    )
+
+
+def _power_symbol_definition(power: dict) -> str:
+    name = _esc(power["name"])
+    ground = power["glyph"] == "ground"
+    if ground:
+        reference_y = -6.35
+        value_y = -3.81
+        pin_angle = 270
+        body = (
+            f'\t\t\t(symbol "{name}_0_1"\n'
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy -2.54 0) (xy 2.54 0))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy 2.54 0) (xy 0 -2.54))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy 0 -2.54) (xy -2.54 0))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t)\n"
+        )
+    else:
+        reference_y = -2.54
+        value_y = 2.286
+        pin_angle = 90
+        body = (
+            f'\t\t\t(symbol "{name}_0_1"\n'
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy 0 2.54) (xy 0 0))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy -1.27 2.54) (xy 1.27 2.54))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t)\n"
+        )
+    return (
+        f'\t\t(symbol "power:{name}"\n'
+        "\t\t\t(power)\n"
+        "\t\t\t(pin_numbers hide)\n"
+        "\t\t\t(pin_names (offset 0) hide)\n"
+        "\t\t\t(exclude_from_sim no)\n"
+        "\t\t\t(in_bom yes)\n"
+        "\t\t\t(on_board yes)\n"
+        '\t\t\t(property "Reference" "#PWR"\n'
+        f"\t\t\t\t(at 0 {reference_y} 0)\n"
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n"
+        "\t\t\t)\n"
+        f'\t\t\t(property "Value" "{name}"\n'
+        f"\t\t\t\t(at 0 {value_y} 0)\n"
+        "\t\t\t\t(effects (font (size 1.27 1.27)))\n"
+        "\t\t\t)\n"
+        f"{body}"
+        f'\t\t\t(symbol "{name}_1_1"\n'
+        "\t\t\t\t(pin power_in line\n"
+        f"\t\t\t\t\t(at 0 0 {pin_angle})\n"
+        "\t\t\t\t\t(length 0)\n"
+        f'\t\t\t\t\t(name "{name}" '
+        "(effects (font (size 1.27 1.27))))\n"
+        '\t\t\t\t\t(number "1" '
+        "(effects (font (size 1.27 1.27))))\n"
+        "\t\t\t\t)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+    )
+
+
+def _power_symbol_instance(factory, transform, power: dict) -> str:
+    x, y = transform.xy(*power["point"])
+    angle = int(power.get("angle", 0)) % 360
+    name = _esc(power["name"])
+    reference = _esc(power.get("reference", "#PWR0001"))
+    text = power.get("text")
+    if text:
+        value_x, value_y = transform.xy(
+            (text["x"] + text["x1"]) / 2,
+            (text["y"] + text["y1"]) / 2,
+        )
+        value_angle = int(round(text.get("angle", 0))) % 360
+        value_hide = ""
+    else:
+        value_x, value_y = x, y
+        value_angle = angle
+        value_hide = " (hide yes)"
+    return (
+        "\t(symbol\n"
+        f'\t\t(lib_id "power:{name}")\n'
+        f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
+        "\t\t(unit 1)\n"
+        "\t\t(exclude_from_sim no)\n"
+        "\t\t(in_bom yes)\n"
+        "\t\t(on_board yes)\n"
+        "\t\t(dnp no)\n"
+        f'\t\t(uuid "{factory.new("power-symbol")}")\n'
+        f'\t\t(property "Reference" "{reference}"\n'
+        f"\t\t\t(at {x:.2f} {y:.2f} {angle})\n"
+        "\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n"
+        "\t\t)\n"
+        f'\t\t(property "Value" "{name}"\n'
+        f"\t\t\t(at {value_x:.2f} {value_y:.2f} {value_angle})\n"
+        f"\t\t\t(effects (font (size 1.27 1.27)){value_hide})\n"
+        "\t\t)\n"
+        f'\t\t(pin "1" (uuid "{factory.new("power-pin")}"))\n'
+        "\t\t(instances\n"
+        '\t\t\t(project ""\n'
+        "\t\t\t\t(path \"/\"\n"
+        f'\t\t\t\t\t(reference "{reference}")\n'
+        "\t\t\t\t\t(unit 1)\n"
+        "\t\t\t\t)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
         "\t)\n"
     )
 
@@ -1452,6 +1660,12 @@ def render_page(
         _header(factory, transform.paper, title, worksheet_fields),
         "\t(lib_symbols\n",
     ]
+    emitted_power_definitions = set()
+    for power in semantic["power_ports"]:
+        name = power["name"]
+        if name not in emitted_power_definitions:
+            parts.append(_power_symbol_definition(power))
+            emitted_power_definitions.add(name)
     lib_ids = []
     occurrences = Counter()
     emitted_definitions = set()
@@ -1491,11 +1705,9 @@ def render_page(
         parts.append(_wire(factory, transform, wire))
     for component, lib_id in zip(semantic["components"], lib_ids):
         parts.append(_component_instance(factory, transform, component, lib_id))
-    for label in (
-        semantic["power_ports"]
-        + semantic["global_labels"]
-        + semantic["local_labels"]
-    ):
+    for power in semantic["power_ports"]:
+        parts.append(_power_symbol_instance(factory, transform, power))
+    for label in semantic["global_labels"] + semantic["local_labels"]:
         parts.append(_label(factory, transform, label))
 
     if keep_graphics:
@@ -1628,6 +1840,11 @@ def convert_pdf(
     multi_unit_groups = detect_multi_units(
         [record["semantic"] for record in page_records]
     )
+    power_number = 1
+    for record in page_records:
+        for power in record["semantic"]["power_ports"]:
+            power["reference"] = f"#PWR{power_number:04d}"
+            power_number += 1
     for record in page_records:
         index = record["index"]
         page = record["page"]

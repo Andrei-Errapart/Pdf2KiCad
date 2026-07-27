@@ -426,6 +426,178 @@ class MultiUnitTests(unittest.TestCase):
         self.assertIn("\t\t(unit 2)\n", placement_b)
 
 
+class PowerSymbolTests(unittest.TestCase):
+    def test_supply_bar_is_consumed_and_becomes_native_power_symbol(self):
+        power_text = {
+            "text": "VDD_CORE",
+            "color": "#000000",
+            "x": 7.0,
+            "y": 6.0,
+            "x1": 13.0,
+            "y1": 7.2,
+            "size": 1.15,
+            "angle": 0,
+        }
+        page = {
+            "lines": [
+                line("#000000", 10.0, 8.73, 10.0, 10.0),
+                line("#000000", 9.365, 8.73, 10.635, 8.73),
+            ],
+            "texts": [power_text],
+            "decoded": {
+                "components": [{}],
+                "worksheet": None,
+            },
+        }
+        consumed_texts = set()
+        consumed_lines = set()
+
+        ports = pdf2kicad.decode_power_ports(
+            page,
+            [],
+            consumed_texts,
+            consumed_lines,
+        )
+
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(ports[0]["name"], "VDD_CORE")
+        self.assertEqual(ports[0]["glyph"], "supply")
+        self.assertEqual(ports[0]["angle"], 0)
+        self.assertEqual(consumed_lines, {0, 1})
+        self.assertEqual(
+            consumed_texts,
+            {pdf2kicad._text_key(power_text)},
+        )
+
+        ports[0]["reference"] = "#PWR0001"
+        definition = pdf2kicad._power_symbol_definition(ports[0])
+        placement = pdf2kicad._power_symbol_instance(
+            pdf2kicad.UuidFactory(b"supply"),
+            pdf2kicad.coordinate_transform("A4"),
+            ports[0],
+        )
+        self.assertIn('(symbol "power:VDD_CORE"', definition)
+        self.assertIn("(power)", definition)
+        self.assertIn("(pin power_in line", definition)
+        self.assertIn('(lib_id "power:VDD_CORE")', placement)
+        self.assertIn('(reference "#PWR0001")', placement)
+        self.assertNotIn("(global_label", placement)
+
+        rendered = pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"supply-page"),
+            {
+                **page,
+                "rectangles": [],
+                "curves": [],
+            },
+            {
+                "components": [],
+                "wires": [],
+                "power_ports": ports,
+                "global_labels": [],
+                "local_labels": [],
+                "consumed_texts": consumed_texts,
+                "semantic_lines": consumed_lines,
+                "semantic_rectangles": set(),
+                "semantic_curves": set(),
+                "worksheet": None,
+            },
+            pdf2kicad.coordinate_transform("A4"),
+            "Power symbol",
+            True,
+        )
+        self.assertNotIn("(global_label", rendered)
+        self.assertNotIn('(text "VDD_CORE"', rendered)
+        self.assertNotIn("(color 0 0 0 1)", rendered)
+
+    def test_ground_triangle_is_consumed_without_a_wire(self):
+        page = {
+            "lines": [
+                line("#000000", 9.0, 10.0, 11.0, 10.0),
+                line("#000000", 11.0, 10.0, 10.0, 11.0),
+                line("#000000", 10.0, 11.0, 9.0, 10.0),
+            ],
+            "texts": [],
+            "decoded": {
+                "components": [{}],
+                "worksheet": None,
+            },
+        }
+        consumed_lines = set()
+
+        ports = pdf2kicad.decode_power_ports(
+            page,
+            [],
+            set(),
+            consumed_lines,
+        )
+
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(ports[0]["name"], "GND")
+        self.assertEqual(ports[0]["glyph"], "ground")
+        self.assertEqual(ports[0]["point"], (10.0, 10.0))
+        self.assertEqual(ports[0]["angle"], 0)
+        self.assertEqual(consumed_lines, {0, 1, 2})
+
+    def test_named_ground_uses_ground_net_text(self):
+        ground_text = {
+            "text": "ADAVSS",
+            "color": "#000000",
+            "x": 7.5,
+            "y": 11.1,
+            "x1": 12.5,
+            "y1": 12.1,
+            "size": 1.15,
+            "angle": 0,
+        }
+        page = {
+            "lines": [
+                line("#000000", 9.0, 10.0, 11.0, 10.0),
+                line("#000000", 11.0, 10.0, 10.0, 11.0),
+                line("#000000", 10.0, 11.0, 9.0, 10.0),
+            ],
+            "texts": [ground_text],
+            "decoded": {
+                "components": [{}],
+                "worksheet": None,
+            },
+        }
+        consumed_texts = set()
+
+        ports = pdf2kicad.decode_power_ports(
+            page,
+            [],
+            consumed_texts,
+            set(),
+        )
+
+        self.assertEqual(ports[0]["name"], "ADAVSS")
+        self.assertEqual(ports[0]["glyph"], "ground")
+        self.assertEqual(
+            consumed_texts,
+            {pdf2kicad._text_key(ground_text)},
+        )
+
+    def test_worksheet_coordinate_triangle_is_not_ground(self):
+        page = {
+            "lines": [
+                line("#000000", 9.0, 10.0, 11.0, 10.0),
+                line("#000000", 11.0, 10.0, 10.0, 11.0),
+                line("#000000", 10.0, 11.0, 9.0, 10.0),
+            ],
+            "texts": [],
+            "decoded": {
+                "components": [{}],
+                "worksheet": {"line_indexes": [0, 1, 2]},
+            },
+        }
+
+        self.assertEqual(
+            pdf2kicad.decode_power_ports(page, [], set(), set()),
+            [],
+        )
+
+
 class GlobalLabelTests(unittest.TestCase):
     def test_all_orcad_page_references_are_consumed(self):
         page_reference = {
