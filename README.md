@@ -11,10 +11,11 @@ names may not be present in the file. The converter therefore creates
 deterministic, project-local generic symbols. By default it also retains
 unconsumed PDF vectors and text as KiCad graphics, so tables, notes, and
 unsupported glyphs remain visible. A detected source worksheet is the
-exception: its frame and corner block are dropped because KiCad supplies its
-own worksheet. The source title, company, date, revision, document number,
-page name, and source page count are parsed when present and transferred to
-the native KiCad title block.
+exception: its PDF frame and corner block are replaced by a project-local copy
+of KiCad's standard worksheet—coordinate divisions, title block, fields, and
+styling included—with zero margins so its frame follows the paper edge. The
+source title, company, date, revision, document number, page name, and source
+page count are parsed when present and transferred to that title block.
 
 Multi-unit components are inferred project-wide when designators with one
 `U<number>` prefix have an uninterrupted suffix sequence beginning with `A`,
@@ -45,7 +46,10 @@ Useful options:
 
 Automatic paper detection reads each page's title block, so mixed-size PDFs
 are supported. The output directory contains a root `.kicad_sch`, one child
-schematic per PDF page, and a `.kicad_pro` file. Child sheet filenames use
+schematic per PDF page, and a `.kicad_pro` file. When the PDF contains a
+worksheet, the output also contains a project-local `.kicad_wks`; PDFs without
+a detected worksheet continue to use KiCad's configured drawing sheet. Child
+sheet filenames use
 the source page number and a reconstructed, sanitized page heading, matching
 the `dsn2kicad.hs` convention (for example,
 `03_Clock_Sys_Config_PWR_on_cnt.kicad_sch`). An object-free first page is
