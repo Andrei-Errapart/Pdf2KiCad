@@ -49,6 +49,7 @@ WIRE_COLOR = pdf_dump.WIRE_COLOR
 BUS_COLOR = "#0000ff"
 REF_RE = pdf_dump.REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
+BODY_CURVE_JOIN_TOL = 0.06
 JUNCTION_COLOR = "#ff0000"
 NO_CONNECT_COLOR = "#803f00"
 # KiCad applies this scale internally when it renders an outline font.  OrCAD
@@ -60,6 +61,7 @@ LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
 MULTI_UNIT_REF_RE = re.compile(r"^(U\d+)([A-Z])$")
+MERGED_PASSIVE_PREFIX_RE = re.compile(r"^(FB|R|C|L)(\d.*)$", re.IGNORECASE)
 PAPER_SCALES = {
     # Capture's standard "fit to A4" print factors.  A3 is reduced to 70%,
     # rather than the mathematically exact sqrt(1/2), in the supplied PDFs.
@@ -237,6 +239,117 @@ def _wire_degree(point, wires: list[dict], tolerance=GEOM_TOL) -> int:
         else:
             degree += 2
     return degree
+
+
+def _looks_like_passive_value(value: str) -> bool:
+    """Return whether *value* can be a passive value fused to a reference."""
+    if not re.match(r"^(?:\d+(?:\.\d*)?|\.\d+)", value):
+        return False
+    return bool(
+        "/" in value
+        or "%" in value
+        or re.search(r"[pnumkKMGR](?:Ω|ohm)?(?:\b|$)", value)
+    )
+
+
+def _split_merged_reference_values(page: dict) -> None:
+    """Split Capture text spans such as ``R13110K/0603``.
+
+    PyMuPDF can coalesce adjacent reference and value fields into one span.
+    References elsewhere on the page disambiguate the run of digits: on a
+    page containing R133--R138, ``R13110K/0603`` is R131 plus 10K/0603,
+    rather than R13 plus 110K/0603.
+
+    The reference replaces the original item and the value is appended.  That
+    preserves indexes already recorded by ``pdf_dump.decode_page``.
+    """
+    texts = page.get("texts", [])
+    known: dict[str, list[int]] = {}
+    for text in texts:
+        match = re.fullmatch(
+            r"(FB|R|C|L)(\d+)[A-Z]?",
+            text.get("text", "").strip(),
+            re.IGNORECASE,
+        )
+        if match:
+            known.setdefault(match.group(1).upper(), []).append(
+                int(match.group(2))
+            )
+
+    additions = []
+    for index, text in enumerate(list(texts)):
+        original = text.get("text", "").strip()
+        if (
+            text.get("color") != "#000000"
+            or REF_RE.fullmatch(original)
+        ):
+            continue
+        match = MERGED_PASSIVE_PREFIX_RE.match(original)
+        if not match:
+            continue
+        prefix, tail = match.group(1).upper(), match.group(2)
+        digit_count = len(tail) - len(tail.lstrip("0123456789"))
+        candidates = []
+        reference_numbers = known.get(prefix, [])
+        digit_lengths = Counter(
+            len(str(number)) for number in reference_numbers
+        )
+        modal_length = (
+            min(
+                digit_lengths,
+                key=lambda length: (-digit_lengths[length], length),
+            )
+            if digit_lengths else None
+        )
+        for split_at in range(1, digit_count):
+            reference_digits = tail[:split_at]
+            passive_value = tail[split_at:]
+            if not _looks_like_passive_value(passive_value):
+                continue
+            reference_number = int(reference_digits)
+            length_penalty = (
+                abs(len(reference_digits) - modal_length) * 1000
+                if modal_length is not None else 0
+            )
+            distance_penalty = (
+                min(
+                    abs(reference_number - known_number)
+                    for known_number in reference_numbers
+                )
+                if reference_numbers else 0
+            )
+            value_number = re.match(
+                r"^(?:\d+(?:\.\d*)?|\.\d+)",
+                passive_value,
+            ).group(0)
+            value_penalty = 0
+            if (
+                value_number == "0"
+                and len(passive_value) > 1
+                and passive_value[1].isalpha()
+            ):
+                value_penalty += 100
+            value_penalty += max(
+                0,
+                len(value_number.split(".", 1)[0].lstrip("0")) - 3,
+            )
+            candidates.append(
+                (
+                    length_penalty,
+                    distance_penalty,
+                    value_penalty,
+                    -len(reference_digits),
+                    f"{prefix}{reference_digits}",
+                    passive_value,
+                )
+            )
+        if not candidates:
+            continue
+        *_score, reference, passive_value = min(candidates)
+        texts[index] = {**text, "text": reference}
+        additions.append({**text, "text": passive_value})
+        known.setdefault(prefix, []).append(int(reference[len(prefix):]))
+    texts.extend(additions)
 
 
 @dataclass(frozen=True)
@@ -560,7 +673,7 @@ def _assign_missing_pin_numbers(pins: list[dict]) -> None:
 def _reference_matches_pin_count(reference: str, pin_count: int) -> bool:
     match = re.match(r"([A-Za-z]+)", reference or "")
     prefix = match.group(1).upper() if match else ""
-    if prefix in ("R", "C", "L", "FB"):
+    if prefix in ("R", "C", "L", "FB", "F"):
         return pin_count <= 2
     if prefix == "TP":
         return pin_count <= 1
@@ -671,24 +784,27 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
 
     curve_indexes = []
     body_curves = []
-    for index, curve in enumerate(page.get("curves", [])):
-        if curve.get("color") != BODY_COLOR or not curve.get("points"):
-            continue
-        curve_bbox = _curve_bbox(curve)
-        if (
-            _point_in_bbox(
-                (curve_bbox["x0"], curve_bbox["y0"]),
+    remaining_curves = [
+        (index, curve, _curve_bbox(curve))
+        for index, curve in enumerate(page.get("curves", []))
+        if curve.get("color") == BODY_COLOR and curve.get("points")
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for candidate in list(remaining_curves):
+            index, curve, curve_bbox = candidate
+            if not _bboxes_touch(
+                curve_bbox,
                 bbox,
-                GEOM_TOL,
-            )
-            and _point_in_bbox(
-                (curve_bbox["x1"], curve_bbox["y1"]),
-                bbox,
-                GEOM_TOL,
-            )
-        ):
+                BODY_CURVE_JOIN_TOL,
+            ):
+                continue
             curve_indexes.append(index)
             body_curves.append(curve)
+            bbox = _bbox_union(bbox, curve_bbox)
+            remaining_curves.remove(candidate)
+            changed = True
 
     pins = component["pins"]
     for index, line in enumerate(page["lines"]):
@@ -733,7 +849,79 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
     component["curve_indexes"] = set(curve_indexes)
 
 
+def _recover_connector_pin_labels(
+    page: dict,
+    component: dict,
+) -> set[tuple]:
+    """Recover black pin-name text used by connector library symbols."""
+    if (
+        not re.match(r"^CN\d", component.get("reference", ""))
+        or len(component.get("pins", [])) <= 2
+        or any(pin.get("name") for pin in component["pins"])
+    ):
+        return set()
+
+    consumed = set()
+    for pin in component["pins"]:
+        number_text = pin.get("number_text")
+        if number_text and pin.get("number"):
+            pin["name"] = pin["number"]
+            pin["name_text"] = number_text
+            consumed.add(_text_key(number_text))
+
+    label_texts = [
+        text
+        for text in page["texts"]
+        if (
+            text.get("color") == "#000000"
+            and re.fullmatch(r"F\d+", text.get("text", "").strip())
+        )
+    ]
+    scores = []
+    for text_index, text in enumerate(label_texts):
+        for pin_index, pin in enumerate(component["pins"]):
+            if pin.get("name"):
+                continue
+            scored_pin = {**pin, "side": pdf_dump._pin_orientation(pin)}
+            score = pdf_dump._pin_number_score(scored_pin, text)
+            if score is not None:
+                scores.append((score, pin_index, text_index))
+
+    paired_pins = set()
+    paired_texts = set()
+    for _score, pin_index, text_index in sorted(scores):
+        if pin_index in paired_pins or text_index in paired_texts:
+            continue
+        text = label_texts[text_index]
+        value = text["text"].strip()
+        pin = component["pins"][pin_index]
+        pin["number"] = value
+        pin["name"] = value
+        pin["number_text"] = text
+        pin["name_text"] = text
+        consumed.add(_text_key(text))
+        paired_pins.add(pin_index)
+        paired_texts.add(text_index)
+    return consumed
+
+
+def _suppress_numeric_j_pin_names(component: dict) -> None:
+    """Discard PDF pin-number spans misclassified as J pin names."""
+    if not re.fullmatch(r"J\d+[A-Z]?", component.get("reference", "")):
+        return
+    names = [
+        str(pin["name"]).strip()
+        for pin in component.get("pins", [])
+        if pin.get("name")
+    ]
+    if not names or any(not name.isdigit() for name in names):
+        return
+    for pin in component["pins"]:
+        pin.pop("name", None)
+
+
 def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
+    _split_merged_reference_values(page)
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
     wires = decoded["wires"]
     known = copy.deepcopy(decoded["components"])
@@ -770,14 +958,16 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
                 _line_matches_pin(line, pin) for pin in component["pins"]
             ):
                 component_line_indexes.add(index)
-        for pin in component["pins"]:
-            for key in ("number_text", "name_text"):
-                if pin.get(key):
-                    used_texts.add(_text_key(pin[key]))
         _assign_missing_pin_numbers(component["pins"])
         component["body_lines"] = body_lines
         component["line_indexes"] = component_line_indexes
         _augment_component_geometry(page, component)
+        _suppress_numeric_j_pin_names(component)
+        used_texts.update(_recover_connector_pin_labels(page, component))
+        for pin in component["pins"]:
+            for key in ("number_text", "name_text"):
+                if pin.get(key):
+                    used_texts.add(_text_key(pin[key]))
         component_line_indexes = component["line_indexes"]
         used_line_indexes.update(component_line_indexes)
 
@@ -787,6 +977,7 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
         for text in page["texts"]
         if text.get("color") == "#000000"
         and REF_RE.match(text.get("text", "").strip())
+        and _text_key(text) not in used_texts
         and _text_key(text) not in {
             _text_key(component["reference_text"])
             for component in known
@@ -952,7 +1143,8 @@ def assign_values(
     page: dict, components: list[dict], consumed_texts: set[tuple]
 ) -> None:
     wires = (page.get("decoded") or {}).get("wires", [])
-    pair_scores = []
+    aligned_pair_scores = []
+    body_pair_scores = []
     for component_index, component in enumerate(components):
         reference_text = component.get("reference_text")
         component["value"] = _default_value(component["reference"])
@@ -986,6 +1178,11 @@ def assign_values(
             ):
                 continue
             if (
+                _looks_like_passive_value(value)
+                and reference_prefix not in ("R", "C", "L", "FB")
+            ):
+                continue
+            if (
                 wires
                 and LABEL_RE.match(value)
                 and _nearest_wire_point(
@@ -999,8 +1196,6 @@ def assign_values(
                 continue
             text_bbox = _text_bbox(text)
             bbox_distance = _bbox_distance(reference_bbox, text_bbox)
-            if bbox_distance > 6.0:
-                continue
             text_center = (
                 (text_bbox["x0"] + text_bbox["x1"]) / 2,
                 (text_bbox["y0"] + text_bbox["y1"]) / 2,
@@ -1013,33 +1208,116 @@ def assign_values(
             else:
                 cross_distance = abs(dx)
                 along_distance = abs(dy)
-            if cross_distance > max(2.0, size * 1.8):
-                continue
-            # Capture centers or aligns reference/value text along the symbol
-            # axis.  Prefer that alignment first, then proximity.  Pair all
-            # components globally so a dense row cannot reuse its neighbour's
-            # value text.
-            score = (
-                bbox_distance
-                + cross_distance * 4.0
-                + along_distance * 0.05
-            )
-            if reference_prefix in ("R", "C", "L", "FB") and component.get(
-                "bbox"
+            if (
+                bbox_distance <= 6.0
+                and cross_distance <= max(2.0, size * 1.8)
             ):
-                component_bbox = component["bbox"]
-                component_center = (
-                    (component_bbox["x0"] + component_bbox["x1"]) / 2,
-                    (component_bbox["y0"] + component_bbox["y1"]) / 2,
+                # Capture centers or aligns reference/value text along the
+                # symbol axis.
+                aligned_score = (
+                    bbox_distance
+                    + cross_distance * 4.0
+                    + along_distance * 0.05
                 )
-                score += _distance(text_center, component_center) * 3.0
-            pair_scores.append(
-                (score, component_index, text_index, key)
-            )
+                if (
+                    reference_prefix in ("R", "C", "L", "FB")
+                    and component.get("bbox")
+                ):
+                    component_bbox = component["bbox"]
+                    component_center = (
+                        (
+                            component_bbox["x0"]
+                            + component_bbox["x1"]
+                        ) / 2,
+                        (
+                            component_bbox["y0"]
+                            + component_bbox["y1"]
+                        ) / 2,
+                    )
+                    aligned_score += (
+                        _distance(text_center, component_center) * 3.0
+                    )
+                aligned_pair_scores.append(
+                    (
+                        aligned_score,
+                        component_index,
+                        text_index,
+                        key,
+                    )
+                )
+
+            component_bbox = component.get("bbox")
+            if (
+                component_bbox
+                and reference_prefix in ("U", "CN", "J", "FB", "FL", "SP")
+                and not (
+                    reference_prefix == "U"
+                    and (
+                        value.isdigit()
+                        or _looks_like_passive_value(value)
+                    )
+                )
+            ):
+                gap = text_bbox["y0"] - component_bbox["y1"]
+                horizontal_gap = max(
+                    component_bbox["x0"] - text_bbox["x1"],
+                    text_bbox["x0"] - component_bbox["x1"],
+                    0.0,
+                )
+                left_protrusion = max(
+                    component_bbox["x0"] - text_bbox["x0"],
+                    0.0,
+                )
+                center_alignment = abs(
+                    text_center[0]
+                    - (
+                        component_bbox["x0"] + component_bbox["x1"]
+                    ) / 2
+                )
+                if (
+                    gap >= 0.0
+                    and gap <= max(3.0, size * 2.8)
+                    and horizontal_gap <= max(1.5, size * 1.4)
+                    and min(
+                        left_protrusion,
+                        center_alignment,
+                    ) <= max(1.5, size * 1.4)
+                ):
+                    left_alignment = abs(
+                        text_bbox["x0"] - component_bbox["x0"]
+                    )
+                    body_pair_scores.append(
+                        (
+                            max(gap, 0.0)
+                            + horizontal_gap * 2.0
+                            + min(
+                                left_alignment,
+                                center_alignment,
+                            ) * 0.1,
+                            component_index,
+                            text_index,
+                            key,
+                        )
+                    )
 
     paired_components = set()
     paired_texts = set()
-    for _score, component_index, text_index, key in sorted(pair_scores):
+    for _score, component_index, text_index, key in sorted(
+        aligned_pair_scores
+    ):
+        if component_index in paired_components or key in paired_texts:
+            continue
+        value_text = page["texts"][text_index]
+        component = components[component_index]
+        component["value"] = value_text["text"]
+        component["value_text"] = value_text
+        consumed_texts.add(key)
+        paired_components.add(component_index)
+        paired_texts.add(key)
+
+    for _score, component_index, text_index, key in sorted(
+        body_pair_scores
+    ):
         if component_index in paired_components or key in paired_texts:
             continue
         value_text = page["texts"][text_index]
