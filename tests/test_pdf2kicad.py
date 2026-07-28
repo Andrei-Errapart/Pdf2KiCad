@@ -538,6 +538,514 @@ class SemanticRecoveryTests(unittest.TestCase):
         self.assertIn("(rectangle", rendered)
         self.assertIn("(pts (xy", rendered)
 
+    def test_noise_filter_reference_recovers_rectangular_body(self):
+        self.assertIsNotNone(pdf2kicad.REF_RE.fullmatch("FL1"))
+        reference = {
+            "text": "NF1",
+            "color": "#000000",
+            "x": 10.0,
+            "y": 7.0,
+            "x1": 12.0,
+            "y1": 8.0,
+            "size": 1.0,
+            "angle": 0,
+        }
+        page = {
+            "width": 100.0,
+            "height": 80.0,
+            "lines": [
+                line(pdf2kicad.PIN_COLOR, 8.0, 10.0, 10.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 8.0, 12.0, 10.0, 12.0),
+                line(pdf2kicad.PIN_COLOR, 14.0, 10.0, 16.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 14.0, 12.0, 16.0, 12.0),
+            ],
+            "rectangles": [{
+                "x0": 10.0,
+                "y0": 9.0,
+                "x1": 14.0,
+                "y1": 13.0,
+                "color": pdf2kicad.BODY_COLOR,
+                "fill": None,
+                "width": 0.1,
+            }],
+            "curves": [],
+            "texts": [reference],
+        }
+
+        decoded = pdf2kicad.pdf_dump.decode_page(page)
+
+        self.assertEqual(len(decoded["components"]), 1)
+        self.assertEqual(decoded["components"][0]["reference"], "NF1")
+        self.assertEqual(len(decoded["components"][0]["pins"]), 4)
+
+    def test_coalesced_passive_reference_and_value_are_split(self):
+        merged = {
+            "text": "R13110K/0603",
+            "color": "#000000",
+            "x": 9.0,
+            "y": 7.0,
+            "x1": 16.0,
+            "y1": 8.0,
+            "size": 1.0,
+            "angle": 0,
+        }
+        page = {
+            "lines": [
+                line(pdf2kicad.PIN_COLOR, 7.0, 10.0, 10.0, 10.0),
+                line(pdf2kicad.BODY_COLOR, 10.0, 10.0, 14.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 14.0, 10.0, 17.0, 10.0),
+            ],
+            "rectangles": [],
+            "curves": [],
+            "texts": [
+                merged,
+                {
+                    **merged,
+                    "text": "R133",
+                    "x": 30.0,
+                    "x1": 33.0,
+                },
+            ],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, consumed, _lines = pdf2kicad.decode_components(page)
+        pdf2kicad.assign_values(page, components, consumed)
+
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0]["reference"], "R131")
+        self.assertEqual(components[0]["value"], "10K/0603")
+        self.assertNotIn(
+            "R13110K/0603",
+            [text["text"] for text in page["texts"]],
+        )
+
+    def test_connector_designator_like_pin_labels_stay_on_body(self):
+        def text(value, x, y, x1, y1, angle=0):
+            return {
+                "text": value,
+                "color": "#000000",
+                "x": x,
+                "y": y,
+                "x1": x1,
+                "y1": y1,
+                "size": 1.0,
+                "angle": angle,
+            }
+
+        numbers = [
+            text(str(number), 7.0, 10.5 + number, 8.0, 11.5 + number)
+            for number in range(1, 6)
+        ]
+        fields = {
+            "F1": text("F1", 12.2, 21.5, 13.0, 23.0, 90),
+            "F2": text("F2", 12.2, 7.0, 13.0, 8.5, 90),
+            "F3": text("F3", 15.2, 21.5, 16.0, 23.0, 90),
+            "F4": text("F4", 15.2, 7.0, 16.0, 8.5, 90),
+        }
+        pins = [
+            {
+                "number": str(number),
+                "number_text": numbers[number - 1],
+                "hot": {"x": 8.0, "y": 11.0 + number},
+                "other": {"x": 10.0, "y": 11.0 + number},
+                "length": 2.0,
+            }
+            for number in range(1, 6)
+        ] + [
+            {
+                "number": str(number),
+                "hot": {"x": x, "y": hot_y},
+                "other": {"x": x, "y": other_y},
+                "length": 2.0,
+            }
+            for number, x, hot_y, other_y in (
+                (6, 13.0, 22.0, 20.0),
+                (7, 13.0, 8.0, 10.0),
+                (8, 16.0, 22.0, 20.0),
+                (9, 16.0, 8.0, 10.0),
+            )
+        ]
+        pin_lines = [
+            line(
+                pdf2kicad.PIN_COLOR,
+                pin["hot"]["x"],
+                pin["hot"]["y"],
+                pin["other"]["x"],
+                pin["other"]["y"],
+            )
+            for pin in pins
+        ]
+        cn2 = text("CN2", 20.5, 11.0, 23.0, 12.0)
+        page = {
+            "lines": pin_lines,
+            "rectangles": [],
+            "curves": [],
+            "texts": [cn2, *numbers, *fields.values()],
+            "decoded": {
+                "components": [{
+                    "reference": "F2",
+                    "reference_text": fields["F2"],
+                    "bbox": {
+                        "x0": 10.0,
+                        "y0": 10.0,
+                        "x1": 20.0,
+                        "y1": 20.0,
+                    },
+                    "pins": pins,
+                }],
+                "wires": [{
+                    "start": {"x": 0.0, "y": 30.0},
+                    "end": {"x": 30.0, "y": 30.0},
+                }],
+            },
+        }
+
+        components, consumed, _lines = pdf2kicad.decode_components(page)
+
+        self.assertEqual([item["reference"] for item in components], ["CN2"])
+        recovered = {
+            pin["number"]: pin.get("name")
+            for pin in components[0]["pins"]
+        }
+        self.assertEqual(
+            recovered,
+            {label: label for label in ("1", "2", "3", "4", "5",
+                                        "F1", "F2", "F3", "F4")},
+        )
+        for pin_text in fields.values():
+            self.assertIn(pdf2kicad._text_key(pin_text), consumed)
+
+    def test_values_directly_below_rectangular_bodies_are_paired(self):
+        def text(value, x, y, x1, y1):
+            return {
+                "text": value,
+                "color": "#000000",
+                "x": x,
+                "y": y,
+                "x1": x1,
+                "y1": y1,
+                "size": 1.0,
+                "angle": 0,
+            }
+
+        references = [
+            text("CN5", 10.0, 7.0, 12.0, 8.0),
+            text("U21", 50.0, 7.0, 52.0, 8.0),
+            text("FB22", 87.0, 9.0, 90.0, 10.0),
+            text("SP1", 110.0, 7.0, 112.0, 8.0),
+        ]
+        values = [
+            text("JXD0-0019NL", 10.0, 40.1, 18.0, 41.1),
+            text("KSZ9131RNXI", 50.0, 40.1, 58.0, 41.1),
+            text("BLM15AX121SN1D", 87.0, 12.5, 97.0, 13.5),
+            text("2SSB-4.0", 109.0, 14.5, 115.0, 15.5),
+        ]
+        inside_body_label = text("S1.8V", 50.0, 39.8, 54.0, 40.8)
+        components = [
+            {
+                "reference": reference["text"],
+                "reference_text": reference,
+                "bbox": bbox,
+            }
+            for reference, bbox in zip(
+                references,
+                (
+                    {"x0": 10.0, "y0": 10.0, "x1": 30.0, "y1": 40.0},
+                    {"x0": 50.0, "y0": 10.0, "x1": 70.0, "y1": 40.0},
+                    {"x0": 90.0, "y0": 10.0, "x1": 94.0, "y1": 12.0},
+                    {
+                        "x0": 110.0,
+                        "y0": 10.0,
+                        "x1": 114.0,
+                        "y1": 14.0,
+                    },
+                ),
+            )
+        ]
+        consumed = {
+            pdf2kicad._text_key(reference)
+            for reference in references
+        }
+
+        pdf2kicad.assign_values(
+            {"texts": [*references, inside_body_label, *values]},
+            components,
+            consumed,
+        )
+
+        self.assertEqual(
+            [component["value"] for component in components],
+            [value["text"] for value in values],
+        )
+        self.assertNotIn(
+            pdf2kicad._text_key(inside_body_label),
+            consumed,
+        )
+
+    def test_passive_value_is_not_claimed_by_nearby_connector(self):
+        def text(value, x, y, x1, y1):
+            return {
+                "text": value,
+                "color": "#000000",
+                "x": x,
+                "y": y,
+                "x1": x1,
+                "y1": y1,
+                "size": 1.15,
+                "angle": 0,
+            }
+
+        c133 = text("C133", 195.575, 97.859, 198.332, 99.135)
+        cn15 = text("CN15", 208.91, 99.892, 211.84, 101.167)
+        capacitor_value = text(
+            "0.1u/10V/0603/X7R",
+            195.575,
+            99.129,
+            205.555,
+            100.405,
+        )
+        connector_value = text(
+            "DF40TC(4.0)-30DS-0.4V(58)",
+            205.735,
+            124.53,
+            220.469,
+            125.806,
+        )
+        components = [
+            {
+                "reference": "C133",
+                "reference_text": c133,
+                "bbox": {
+                    "x0": 193.675,
+                    "y0": 97.79,
+                    "x1": 194.945,
+                    "y1": 99.06,
+                },
+            },
+            {
+                "reference": "CN15",
+                "reference_text": cn15,
+                "bbox": {
+                    "x0": 209.55,
+                    "y0": 101.6,
+                    "x1": 215.9,
+                    "y1": 121.92,
+                },
+            },
+        ]
+        consumed = {
+            pdf2kicad._text_key(c133),
+            pdf2kicad._text_key(cn15),
+        }
+
+        pdf2kicad.assign_values(
+            {
+                "texts": [
+                    c133,
+                    cn15,
+                    capacitor_value,
+                    connector_value,
+                ],
+            },
+            components,
+            consumed,
+        )
+
+        self.assertEqual(
+            [component["value"] for component in components],
+            [
+                "0.1u/10V/0603/X7R",
+                "DF40TC(4.0)-30DS-0.4V(58)",
+            ],
+        )
+
+    def test_j_connector_numeric_pdf_names_are_suppressed(self):
+        def text(value, x, y, x1, y1, color="#000000"):
+            return {
+                "text": value,
+                "color": color,
+                "x": x,
+                "y": y,
+                "x1": x1,
+                "y1": y1,
+                "size": 1.0,
+                "angle": 0,
+            }
+
+        reference = text("J4", 10.0, 7.0, 12.0, 8.0)
+        value = text("HIF3H-16DA-2.54DSA", 8.0, 20.5, 16.0, 21.5)
+        merged_name = text("1112", 10.5, 14.0, 12.5, 15.0, "#0000cc")
+        pins = [
+            {
+                "number": "11",
+                "name": "1112",
+                "name_text": merged_name,
+                "hot": {"x": 8.0, "y": 14.0},
+                "other": {"x": 10.0, "y": 14.0},
+                "length": 2.0,
+            },
+            {
+                "number": "12",
+                "hot": {"x": 16.0, "y": 14.0},
+                "other": {"x": 14.0, "y": 14.0},
+                "length": 2.0,
+            },
+        ]
+        page = {
+            "lines": [],
+            "rectangles": [{
+                "x0": 10.0,
+                "y0": 10.0,
+                "x1": 14.0,
+                "y1": 20.0,
+                "color": pdf2kicad.BODY_COLOR,
+                "fill": None,
+                "width": 0.1,
+            }],
+            "curves": [],
+            "texts": [reference, value, merged_name],
+            "decoded": {
+                "components": [{
+                    "reference": "J4",
+                    "reference_text": reference,
+                    "bbox": {
+                        "x0": 10.0,
+                        "y0": 10.0,
+                        "x1": 14.0,
+                        "y1": 20.0,
+                    },
+                    "pins": pins,
+                }],
+                "wires": [],
+            },
+        }
+
+        components, consumed, _lines = pdf2kicad.decode_components(page)
+        pdf2kicad.assign_values(page, components, consumed)
+
+        recovered = components[0]
+        self.assertEqual(recovered["value"], "HIF3H-16DA-2.54DSA")
+        self.assertTrue(all(not pin.get("name") for pin in recovered["pins"]))
+        rendered = pdf2kicad._symbol_definition(
+            pdf2kicad.UuidFactory(b"j-connector"),
+            pdf2kicad.coordinate_transform("A4"),
+            recovered,
+            "pdf2kicad:J4",
+        )
+        self.assertIn("(pin_names (offset 1.016) hide)", rendered)
+        self.assertNotIn('(name "1112"', rendered)
+
+    def test_gp_reference_and_segmented_circle_become_one_symbol(self):
+        reference = {
+            "text": "GP1",
+            "color": "#000000",
+            "x": 9.0,
+            "y": 7.0,
+            "x1": 11.0,
+            "y1": 8.0,
+            "size": 1.0,
+            "angle": 0,
+        }
+        value = {
+            **reference,
+            "text": "HK-2-G",
+            "y": 8.2,
+            "y1": 9.2,
+        }
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 10.0, 12.0, 10.0, 13.0),
+                line(pdf2kicad.PIN_COLOR, 10.0, 13.0, 10.0, 15.0),
+            ],
+            "rectangles": [],
+            "curves": [
+                {
+                    "points": points,
+                    "color": pdf2kicad.BODY_COLOR,
+                    "fill": None,
+                    "width": 0.1,
+                }
+                for points in (
+                    [[10.0, 10.0], [11.0, 11.0]],
+                    [[11.0, 11.0], [10.0, 12.0]],
+                    [[10.0, 12.0], [9.0, 11.0]],
+                    [[9.0, 11.0], [10.0, 10.0]],
+                )
+            ],
+            "texts": [reference, value],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, consumed, _lines = pdf2kicad.decode_components(page)
+        pdf2kicad.assign_values(page, components, consumed)
+
+        self.assertIsNotNone(pdf2kicad.REF_RE.fullmatch("GP1"))
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0]["reference"], "GP1")
+        self.assertEqual(components[0]["value"], "HK-2-G")
+        self.assertEqual(len(components[0]["body_curves"]), 4)
+        self.assertEqual(components[0]["curve_indexes"], {0, 1, 2, 3})
+
+    def test_testpoint_segmented_circle_is_absorbed_without_neighbour(self):
+        reference = {
+            "text": "TP1",
+            "color": "#000000",
+            "x": 13.5,
+            "y": 8.0,
+            "x1": 15.5,
+            "y1": 9.0,
+            "size": 1.0,
+            "angle": 0,
+        }
+        circle = [
+            [[12.0, 9.0], [13.0, 10.0]],
+            [[13.0, 10.0], [12.0, 11.0]],
+            [[12.0, 11.0], [11.0, 10.0]],
+            [[11.0, 10.0], [12.0, 9.0]],
+        ]
+        curves = [
+            {
+                "points": points,
+                "color": pdf2kicad.BODY_COLOR,
+                "fill": None,
+                "width": 0.1,
+            }
+            for points in circle
+        ]
+        curves.append({
+            "points": [[11.0, 11.17], [12.0, 12.17]],
+            "color": pdf2kicad.BODY_COLOR,
+            "fill": None,
+            "width": 0.1,
+        })
+        page = {
+            "lines": [
+                line(pdf2kicad.PIN_COLOR, 8.0, 10.0, 10.0, 10.0),
+                line(pdf2kicad.BODY_COLOR, 10.0, 10.0, 11.0, 10.0),
+            ],
+            "rectangles": [],
+            "curves": curves,
+            "texts": [reference],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, _consumed, _lines = pdf2kicad.decode_components(page)
+
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0]["reference"], "TP1")
+        self.assertEqual(len(components[0]["body_curves"]), 4)
+        self.assertEqual(components[0]["curve_indexes"], {0, 1, 2, 3})
+
     def test_passive_reference_is_reassigned_from_multi_pin_body(self):
         r383 = {
             "text": "R383",
