@@ -50,6 +50,7 @@ BUS_COLOR = "#0000ff"
 REF_RE = pdf_dump.REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
 BODY_CURVE_JOIN_TOL = 0.06
+BODY_HALF_JOIN_TOL = 1.5
 JUNCTION_COLOR = "#ff0000"
 NO_CONNECT_COLOR = "#803f00"
 # KiCad applies this scale internally when it renders an outline font.  OrCAD
@@ -546,20 +547,21 @@ def detect_sheet_names(pages: list[dict]) -> list[str]:
     return names
 
 
-def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
-    records = [
+def _geometry_clusters(
+    page: dict,
+    excluded_indexes: set[int],
+    excluded_curve_indexes: set[int] | None = None,
+) -> list[dict]:
+    body_records = [
         (index, line)
         for index, line in enumerate(page["lines"])
         if (
             index not in excluded_indexes
-            and line.get("color") in (BODY_COLOR, PIN_COLOR)
+            and line.get("color") == BODY_COLOR
             and pdf_dump._line_length(line) >= GEOM_TOL
         )
     ]
-    if not records:
-        return []
-
-    parent = list(range(len(records)))
+    parent = list(range(len(body_records)))
 
     def find(index):
         while parent[index] != index:
@@ -574,7 +576,7 @@ def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
 
     endpoints: dict[tuple[int, int], list[int]] = {}
     tolerance = 0.06
-    for record_index, (_line_index, line) in enumerate(records):
+    for record_index, (_line_index, line) in enumerate(body_records):
         for x, y in (_point(line, 1), _point(line, 2)):
             key = (round(x / tolerance), round(y / tolerance))
             for other in endpoints.get(key, []):
@@ -582,26 +584,58 @@ def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
             endpoints.setdefault(key, []).append(record_index)
 
     grouped: dict[int, list[tuple[int, dict]]] = {}
-    for record_index, record in enumerate(records):
+    for record_index, record in enumerate(body_records):
         grouped.setdefault(find(record_index), []).append(record)
 
     clusters = []
     for entries in grouped.values():
-        body = [line for _index, line in entries if line["color"] == BODY_COLOR]
-        pins = [line for _index, line in entries if line["color"] == PIN_COLOR]
-        if not body or not pins:
-            continue
+        body = [line for _index, line in entries]
         clusters.append(
             {
-                "entries": entries,
+                "entries": list(entries),
                 "body_lines": body,
-                "pin_lines": pins,
+                "pin_lines": [],
                 "bbox": _bbox_for_lines(body),
             }
         )
 
-    # Capacitor plates are two disconnected body/pin components.  Merge only
-    # close one-pin halves; adjacent resistor networks are farther apart.
+    # Build components outward from body geometry.  Pin-to-pin contact is an
+    # electrical connection between two symbols, not evidence that their
+    # bodies belong to one symbol. Directly connected symbols can otherwise
+    # be merged into a single component.
+    assigned_pin_indexes = set()
+    for index, line in enumerate(page["lines"]):
+        if (
+            index in excluded_indexes
+            or line.get("color") != PIN_COLOR
+            or pdf_dump._line_length(line) < GEOM_TOL
+        ):
+            continue
+        candidates = []
+        for cluster_index, cluster in enumerate(clusters):
+            distance = min(
+                _point_to_segment(
+                    point,
+                    _point(body_line, 1),
+                    _point(body_line, 2),
+                )[0]
+                for point in (_point(line, 1), _point(line, 2))
+                for body_line in cluster["body_lines"]
+            )
+            if distance <= GEOM_TOL:
+                candidates.append((distance, cluster_index))
+        if not candidates:
+            continue
+        _distance_score, cluster_index = min(candidates)
+        clusters[cluster_index]["entries"].append((index, line))
+        clusters[cluster_index]["pin_lines"].append(line)
+        assigned_pin_indexes.add(index)
+
+    clusters = [cluster for cluster in clusters if cluster["pin_lines"]]
+
+    # Capacitor plates and the two disconnected colored halves of filled
+    # diode glyphs each appear as aligned one-pin bodies.  Merge only close,
+    # opposed halves; adjacent complete passives are farther apart.
     changed = True
     while changed:
         changed = False
@@ -613,7 +647,21 @@ def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
                 second = clusters[second_index]
                 if len(second["pin_lines"]) != 1:
                     continue
-                if _bbox_distance(first["bbox"], second["bbox"]) > 0.75:
+                if (
+                    _bbox_distance(first["bbox"], second["bbox"])
+                    > BODY_HALF_JOIN_TOL
+                ):
+                    continue
+                merged_bbox = _bbox_union(first["bbox"], second["bbox"])
+                merged_probe = {
+                    "bbox": merged_bbox,
+                    "pin_lines": (
+                        first["pin_lines"] + second["pin_lines"]
+                    ),
+                }
+                if not _has_symmetric_two_pin_geometry(
+                    {"pins": _pins_from_cluster(merged_probe)}
+                ):
                     continue
                 merged_entries = first["entries"] + second["entries"]
                 merged_body = first["body_lines"] + second["body_lines"]
@@ -622,13 +670,95 @@ def _geometry_clusters(page: dict, excluded_indexes: set[int]) -> list[dict]:
                     "entries": merged_entries,
                     "body_lines": merged_body,
                     "pin_lines": merged_pins,
-                    "bbox": _bbox_for_lines(merged_body),
+                    "bbox": merged_bbox,
                 }
                 del clusters[second_index]
                 changed = True
                 break
             if changed:
                 break
+
+    # Inductor bodies in Capture PDFs are commonly emitted entirely as
+    # segmented Bézier curves.  Recover curve-only bodies with their two pin
+    # stubs instead of leaving the curves as graphics and turning the nearby
+    # "L<n>" text into a bodyless placeholder symbol.
+    excluded_curve_indexes = excluded_curve_indexes or set()
+    curve_records = []
+    for index, curve in enumerate(page.get("curves", [])):
+        if (
+            index in excluded_curve_indexes
+            or curve.get("color") != BODY_COLOR
+            or not curve.get("points")
+        ):
+            continue
+        curve_bbox = _curve_bbox(curve)
+        if any(
+            _bboxes_touch(curve_bbox, cluster["bbox"], BODY_CURVE_JOIN_TOL)
+            for cluster in clusters
+        ):
+            continue
+        curve_records.append((index, curve, curve_bbox))
+
+    curve_parent = list(range(len(curve_records)))
+
+    def curve_find(index):
+        while curve_parent[index] != index:
+            curve_parent[index] = curve_parent[curve_parent[index]]
+            index = curve_parent[index]
+        return index
+
+    def curve_union(first, second):
+        first, second = curve_find(first), curve_find(second)
+        if first != second:
+            curve_parent[second] = first
+
+    for first_index, (_index, _curve, first_bbox) in enumerate(curve_records):
+        for second_index in range(first_index + 1, len(curve_records)):
+            second_bbox = curve_records[second_index][2]
+            if _bboxes_touch(
+                first_bbox,
+                second_bbox,
+                BODY_CURVE_JOIN_TOL,
+            ):
+                curve_union(first_index, second_index)
+
+    grouped_curves: dict[int, list[tuple[int, dict, dict]]] = {}
+    for record_index, record in enumerate(curve_records):
+        grouped_curves.setdefault(curve_find(record_index), []).append(record)
+
+    for curve_group in grouped_curves.values():
+        bbox = _bbox_union(*(record[2] for record in curve_group))
+        pin_entries = []
+        pin_lines = []
+        for index, line in enumerate(page["lines"]):
+            if (
+                index in excluded_indexes
+                or index in assigned_pin_indexes
+                or line.get("color") != PIN_COLOR
+                or pdf_dump._line_length(line) < GEOM_TOL
+                or not _bboxes_touch(
+                    _bbox_for_lines([line]),
+                    bbox,
+                    GEOM_TOL,
+                )
+            ):
+                continue
+            pin_entries.append((index, line))
+            pin_lines.append(line)
+        if not pin_lines:
+            continue
+        clusters.append(
+            {
+                "entries": pin_entries,
+                "body_lines": [],
+                "body_curves": [record[1] for record in curve_group],
+                "pin_lines": pin_lines,
+                "bbox": bbox,
+                "curve_indexes": {
+                    record[0] for record in curve_group
+                },
+            }
+        )
     return clusters
 
 
@@ -668,6 +798,68 @@ def _assign_missing_pin_numbers(pins: list[dict]) -> None:
         pin["number"] = str(next_number)
         used.add(str(next_number))
         next_number += 1
+
+
+def _recover_visible_pin_numbers(
+    page: dict,
+    component: dict,
+    consumed_texts: set[tuple],
+) -> set[tuple]:
+    """Use numeric PDF labels beside pins on non-rectangular symbols."""
+    pins = component.get("pins", [])
+    replaceable = [
+        index
+        for index, pin in enumerate(pins)
+        if not pin.get("number_text")
+    ]
+    if len(pins) < 3 or not replaceable:
+        return set()
+
+    candidates = [
+        text
+        for text in pdf_dump._pin_number_candidates(page["texts"])
+        if _text_key(text) not in consumed_texts
+    ]
+    scores = []
+    for pin_index in replaceable:
+        pin = {
+            **pins[pin_index],
+            "side": pdf_dump._pin_orientation(pins[pin_index]),
+        }
+        for text_index, text in enumerate(candidates):
+            score = pdf_dump._pin_number_score(pin, text)
+            if score is not None:
+                scores.append((score, pin_index, text_index))
+
+    paired_pins = set()
+    paired_texts = set()
+    recovered = set()
+    for _score, pin_index, text_index in sorted(scores):
+        if pin_index in paired_pins or text_index in paired_texts:
+            continue
+        text = candidates[text_index]
+        pins[pin_index]["number"] = text["text"].strip()
+        pins[pin_index]["number_text"] = text
+        paired_pins.add(pin_index)
+        paired_texts.add(text_index)
+        recovered.add(_text_key(text))
+
+    if recovered:
+        used = {
+            str(pin["number"])
+            for pin in pins
+            if pin.get("number_text") and pin.get("number")
+        }
+        next_number = 1
+        for pin_index in replaceable:
+            if pin_index in paired_pins:
+                continue
+            while str(next_number) in used:
+                next_number += 1
+            pins[pin_index]["number"] = str(next_number)
+            used.add(str(next_number))
+            next_number += 1
+    return recovered
 
 
 def _reference_matches_pin_count(reference: str, pin_count: int) -> bool:
@@ -772,9 +964,23 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
 
     body_lines = []
     component_line_indexes = set(component.get("line_indexes", set()))
+    reference_match = re.match(
+        r"([A-Za-z]+)",
+        component.get("reference", ""),
+    )
+    reference_prefix = (
+        reference_match.group(1).upper() if reference_match else ""
+    )
     for index, line in enumerate(page["lines"]):
         if (
-            line.get("color") == BODY_COLOR
+            (
+                line.get("color") == BODY_COLOR
+                or (
+                    reference_prefix in ("D", "LD")
+                    and line.get("color") is None
+                    and float(line.get("width") or 0.0) == 0.0
+                )
+            )
             and _bboxes_touch(_bbox_for_lines([line]), bbox, GEOM_TOL)
         ):
             body_lines.append(line)
@@ -927,6 +1133,7 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
     known = copy.deepcopy(decoded["components"])
     used_texts: set[tuple] = set()
     used_line_indexes: set[int] = set()
+    used_curve_indexes: set[int] = set()
 
     page_texts_by_key = {
         _text_key(text): text
@@ -962,6 +1169,9 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
         component["body_lines"] = body_lines
         component["line_indexes"] = component_line_indexes
         _augment_component_geometry(page, component)
+        used_texts.update(
+            _recover_visible_pin_numbers(page, component, used_texts)
+        )
         _suppress_numeric_j_pin_names(component)
         used_texts.update(_recover_connector_pin_labels(page, component))
         for pin in component["pins"]:
@@ -970,8 +1180,13 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
                     used_texts.add(_text_key(pin[key]))
         component_line_indexes = component["line_indexes"]
         used_line_indexes.update(component_line_indexes)
+        used_curve_indexes.update(component.get("curve_indexes", set()))
 
-    clusters = _geometry_clusters(page, used_line_indexes)
+    clusters = _geometry_clusters(
+        page,
+        used_line_indexes,
+        used_curve_indexes,
+    )
     reference_texts = [
         text
         for text in page["texts"]
@@ -1013,9 +1228,18 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
             "bbox": cluster["bbox"],
             "pins": pins,
             "body_lines": cluster["body_lines"],
+            "body_curves": cluster.get("body_curves", []),
             "line_indexes": component_line_indexes,
+            "curve_indexes": set(cluster.get("curve_indexes", set())),
         }
         _augment_component_geometry(page, component)
+        used_texts.update(
+            _recover_visible_pin_numbers(page, component, used_texts)
+        )
+        for pin in component["pins"]:
+            for key in ("number_text", "name_text"):
+                if pin.get(key):
+                    used_texts.add(_text_key(pin[key]))
         component_line_indexes = component["line_indexes"]
         known.append(component)
         used_texts.add(_text_key(text))
@@ -1204,9 +1428,11 @@ def assign_values(
             dy = text_center[1] - reference_center[1]
             if reference_angle == 0:
                 cross_distance = abs(dy)
+                cross_offset = dy
                 along_distance = abs(dx)
             else:
                 cross_distance = abs(dx)
+                cross_offset = dx
                 along_distance = abs(dy)
             if (
                 bbox_distance <= 6.0
@@ -1218,6 +1444,7 @@ def assign_values(
                     bbox_distance
                     + cross_distance * 4.0
                     + along_distance * 0.05
+                    + max(0.0, -cross_offset) * 5.0
                 )
                 if (
                     reference_prefix in ("R", "C", "L", "FB")
