@@ -1664,6 +1664,8 @@ def extract_texts(page, raw: bool):
                     "angle": angle,
                     "color": _color_int_hex(span.get('color', 0)),
                     "font": span.get('font', ''),
+                    "bold": bool(span.get('flags', 0) & 16),
+                    "italic": bool(span.get('flags', 0) & 2),
                 })
 
     return texts
