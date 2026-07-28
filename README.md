@@ -30,6 +30,13 @@ and attaches to its wire or bus, and the consumed PDF text/chevron is omitted
 from residual graphics. Compact filled connection dots become native KiCad
 junctions. Recovered PDF text uses its source bold/italic style and an
 Arial-compatible outline font with KiCad's font-size compensation.
+Local net labels attach through their Capture text-baseline anchor, avoiding
+nearby bus-entry diagonals in dense breakouts. Reference/value fields are
+paired globally across compact component banks, and symmetric opposed two-pin
+symbols omit their generated pin numbers. Diagonal bus breakouts become native
+KiCad bus entries, and Capture no-connect crosses become native KiCad
+no-connect markers. Disconnected passive strokes, rectangles, and curves are
+absorbed into their symbols; one-pin symbols also hide generated pin numbers.
 
 ## Usage
 
