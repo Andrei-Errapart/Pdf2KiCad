@@ -37,6 +37,12 @@ symbols omit their generated pin numbers. Diagonal bus breakouts become native
 KiCad bus entries, and Capture no-connect crosses become native KiCad
 no-connect markers. Disconnected passive strokes, rectangles, and curves are
 absorbed into their symbols; one-pin symbols also hide generated pin numbers.
+Adjacent reference/value fields coalesced into one PDF text span are split
+before recovery, values printed directly below rectangular IC bodies are
+associated with those bodies, and connector pin labels that resemble
+designators remain pins rather than becoming bodyless components. Segmented
+round outlines used by ground points and testpoints are absorbed into their
+symbols instead of being emitted as standalone graphics.
 
 ## Usage
 

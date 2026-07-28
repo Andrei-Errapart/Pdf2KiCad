@@ -52,7 +52,7 @@ CHEVRON_MIN_ARM = 0.25
 CHEVRON_MAX_ARM = 3.0
 CHEVRON_POINT_TOL = 0.12
 REF_RE = re.compile(
-    r"^(?:U|CN|J|P|R|C|L|D|Q|Y|FB|TP|SW|DSW|SD|SCR|SP|X|F|VR)\d+[A-Z]?$"
+    r"^(?:U|CN|J|P|R|C|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SP|X|F|VR)\d+[A-Z]?$"
 )
 
 
