@@ -745,6 +745,8 @@ class GlobalLabelTests(unittest.TestCase):
         labels = pdf2kicad.decode_global_labels(
             page,
             [],
+            [],
+            [],
             consumed_texts,
             set(),
         )
@@ -805,6 +807,8 @@ class GlobalLabelTests(unittest.TestCase):
         pdf2kicad.decode_global_labels(
             page,
             [],
+            [],
+            [],
             consumed_texts,
             consumed_lines,
         )
@@ -848,6 +852,8 @@ class GlobalLabelTests(unittest.TestCase):
                     labels = pdf2kicad.decode_global_labels(
                         page,
                         [],
+                        [],
+                        [],
                         consumed_texts,
                         consumed_lines,
                     )
@@ -856,6 +862,61 @@ class GlobalLabelTests(unittest.TestCase):
                 self.assertEqual(labels[0]["direction"], direction)
                 self.assertEqual(consumed_lines, {2, 3})
                 self.assertEqual(len(consumed_texts), 1)
+
+    def test_text_side_selects_opposite_glyph_extreme_as_hotpoint(self):
+        label_text = {
+            "text": "PWEN1",
+            "color": "#ff0000",
+            "x": 10.0,
+            "y": 9.0,
+            "x1": 15.0,
+            "y1": 11.0,
+            "size": 2.0,
+            "angle": 0,
+        }
+        page = {
+            "lines": [
+                line("#000000", 8.0, 10.0, 9.0, 9.0),
+                line("#000000", 8.0, 10.0, 9.0, 11.0),
+                line("#000000", 9.0, 9.0, 10.0, 10.0),
+                line("#000000", 9.0, 11.0, 10.0, 10.0),
+            ],
+            "texts": [label_text],
+            "decoded": {"components": [{}]},
+        }
+        wires = [{
+            "start": {"x": 5.0, "y": 10.0},
+            "end": {"x": 8.0, "y": 10.0},
+        }]
+        decoded_label = {
+            "name": "PWEN1",
+            # The selected chevron points left even though the source text,
+            # and therefore the native label body, is on the right.
+            "direction": "left",
+            "apex": {"x": 9.0, "y": 10.0},
+            "base": {"x": 10.0, "y": 10.0},
+            "hotpoint": {"x": 10.0, "y": 10.0},
+            "line_indexes": [0, 1, 2, 3],
+            "text": label_text,
+        }
+
+        with mock.patch.object(
+            pdf2kicad.pdf_dump,
+            "decode_global_labels",
+            return_value=[decoded_label],
+        ):
+            labels = pdf2kicad.decode_global_labels(
+                page,
+                wires,
+                [],
+                [],
+                set(),
+                set(),
+            )
+
+        self.assertEqual(labels[0]["point"], (8.0, 10.0))
+        self.assertEqual(labels[0]["direction"], "right")
+        self.assertEqual(labels[0]["angle"], 0)
 
     def test_left_facing_label_body_is_away_from_right_hand_wire(self):
         label = {
@@ -872,6 +933,162 @@ class GlobalLabelTests(unittest.TestCase):
         )
         self.assertIn("(at 8.46 7.46 180)", rendered)
         self.assertIn("(justify right)", rendered)
+
+
+class JunctionTests(unittest.TestCase):
+    @staticmethod
+    def quarter(x0, y0, x1, y1):
+        return {
+            "points": [[x0, y0], [x1, y0], [x1, y1]],
+            "color": "#ff0000",
+            "fill": "#ff0000",
+            "width": 0,
+        }
+
+    def test_red_pdf_dot_becomes_native_junction(self):
+        page = {
+            "curves": [
+                self.quarter(9.75, 9.75, 10.0, 10.0),
+                self.quarter(10.0, 9.75, 10.25, 10.0),
+                self.quarter(9.75, 10.0, 10.0, 10.25),
+                self.quarter(10.0, 10.0, 10.25, 10.25),
+            ],
+        }
+        wires = [
+            {
+                "start": {"x": 5.0, "y": 10.0},
+                "end": {"x": 10.0, "y": 10.0},
+            },
+            {
+                "start": {"x": 10.0, "y": 10.0},
+                "end": {"x": 15.0, "y": 10.0},
+            },
+            {
+                "start": {"x": 10.0, "y": 10.0},
+                "end": {"x": 10.0, "y": 15.0},
+            },
+        ]
+        consumed_curves = set()
+
+        junctions = pdf2kicad.decode_junctions(
+            page,
+            wires,
+            consumed_curves,
+        )
+
+        self.assertEqual(junctions, [(10.0, 10.0)])
+        self.assertEqual(consumed_curves, {0, 1, 2, 3})
+        rendered = pdf2kicad._junction(
+            pdf2kicad.UuidFactory(b"junction"),
+            pdf2kicad.coordinate_transform("A4"),
+            junctions[0],
+        )
+        self.assertIn("(junction", rendered)
+        self.assertIn("(at 7.46 7.46)", rendered)
+        self.assertIn("(diameter 0)", rendered)
+
+    def test_red_circle_without_three_wire_branches_stays_graphic(self):
+        page = {
+            "curves": [
+                self.quarter(9.75, 9.75, 10.0, 10.0),
+                self.quarter(10.0, 9.75, 10.25, 10.0),
+                self.quarter(9.75, 10.0, 10.0, 10.25),
+                self.quarter(10.0, 10.0, 10.25, 10.25),
+            ],
+        }
+        wires = [{
+            "start": {"x": 5.0, "y": 10.0},
+            "end": {"x": 15.0, "y": 10.0},
+        }]
+        consumed_curves = set()
+
+        self.assertEqual(
+            pdf2kicad.decode_junctions(page, wires, consumed_curves),
+            [],
+        )
+        self.assertEqual(consumed_curves, set())
+
+
+class BusTests(unittest.TestCase):
+    def test_blue_capture_segment_becomes_native_bus(self):
+        buses = pdf2kicad.decode_buses({
+            "lines": [
+                line("#0000ff", 5.0, 10.0, 15.0, 10.0),
+                line("#4200ff", 5.0, 12.0, 15.0, 12.0),
+            ],
+        })
+
+        self.assertEqual(
+            buses,
+            [{
+                "start": {"x": 5.0, "y": 10.0},
+                "end": {"x": 15.0, "y": 10.0},
+            }],
+        )
+        rendered = pdf2kicad._bus(
+            pdf2kicad.UuidFactory(b"bus"),
+            pdf2kicad.coordinate_transform("A4"),
+            buses[0],
+        )
+        self.assertIn("(bus", rendered)
+        self.assertIn("(xy 2.46 7.46)", rendered)
+        self.assertIn("(xy 12.46 7.46)", rendered)
+
+
+class TextRenderingTests(unittest.TestCase):
+    def test_pdf_outline_font_is_scaled_and_style_is_preserved(self):
+        rendered = pdf2kicad._graphic_text(
+            pdf2kicad.UuidFactory(b"styled-text"),
+            pdf2kicad.coordinate_transform("A4"),
+            {
+                "text": "Heading",
+                "x": 10.0,
+                "y": 10.0,
+                "x1": 30.0,
+                "y1": 14.0,
+                "size": 2.0,
+                "angle": 0,
+                "color": "#008000",
+                "bold": True,
+                "italic": True,
+            },
+        )
+
+        self.assertIn('(face "Arial")', rendered)
+        self.assertIn("(size 1.43 1.43)", rendered)
+        self.assertIn("(bold yes)", rendered)
+        self.assertIn("(italic yes)", rendered)
+
+    def test_component_fields_use_compensated_outline_font(self):
+        source_component = component("R1")
+        source_component["reference_text"] = {
+            "x": 10.0,
+            "y": 7.0,
+            "x1": 12.0,
+            "y1": 8.15,
+            "size": 1.15,
+            "angle": 0,
+            "bold": True,
+        }
+        source_component["value_text"] = {
+            "x": 10.0,
+            "y": 17.0,
+            "x1": 17.0,
+            "y1": 18.15,
+            "size": 1.15,
+            "angle": 0,
+        }
+
+        rendered = pdf2kicad._component_instance(
+            pdf2kicad.UuidFactory(b"component-text"),
+            pdf2kicad.coordinate_transform("A2"),
+            source_component,
+            "pdf2kicad:R",
+        )
+
+        self.assertEqual(rendered.count('(face "Arial")'), 2)
+        self.assertEqual(rendered.count("(size 1.64 1.64)"), 2)
+        self.assertEqual(rendered.count("(bold yes)"), 1)
 
 
 if __name__ == "__main__":

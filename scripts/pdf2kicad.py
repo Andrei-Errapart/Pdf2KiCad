@@ -46,8 +46,15 @@ KICAD_VERSION = 20260306
 BODY_COLOR = pdf_dump.BODY_COLOR
 PIN_COLOR = pdf_dump.PIN_COLOR
 WIRE_COLOR = pdf_dump.WIRE_COLOR
+BUS_COLOR = "#0000ff"
 REF_RE = pdf_dump.REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
+JUNCTION_COLOR = "#ff0000"
+# KiCad applies this scale internally when it renders an outline font.  OrCAD
+# uses an Arial-compatible outline font in the PDFs handled by this converter,
+# so divide the PDF em size before emitting a KiCad `(size ...)`.
+KICAD_OUTLINE_FONT_COMPENSATION = 1.4
+ORCAD_TEXT_FACE = "Arial"
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
@@ -168,6 +175,49 @@ def _nearest_wire_point(points, wires: list[dict], max_distance: float):
             if dist <= max_distance and (best is None or dist < best[0]):
                 best = (dist, nearest, wire)
     return best
+
+
+def _curve_bbox(curve: dict) -> dict:
+    points = curve["points"]
+    return {
+        "x0": min(point[0] for point in points),
+        "y0": min(point[1] for point in points),
+        "x1": max(point[0] for point in points),
+        "y1": max(point[1] for point in points),
+    }
+
+
+def _bboxes_touch(first: dict, second: dict, tolerance: float) -> bool:
+    return not (
+        first["x1"] < second["x0"] - tolerance
+        or second["x1"] < first["x0"] - tolerance
+        or first["y1"] < second["y0"] - tolerance
+        or second["y1"] < first["y0"] - tolerance
+    )
+
+
+def _wire_degree(point, wires: list[dict], tolerance=GEOM_TOL) -> int:
+    """Return the number of wire branches incident at *point*.
+
+    A point in the middle of a segment contributes two branches while a
+    segment endpoint contributes one.  This also handles a T whose main wire
+    was not split by the PDF producer.
+    """
+    degree = 0
+    for wire in wires:
+        start = (wire["start"]["x"], wire["start"]["y"])
+        end = (wire["end"]["x"], wire["end"]["y"])
+        distance, _nearest = _point_to_segment(point, start, end)
+        if distance > tolerance:
+            continue
+        if (
+            _point_close(point, start, tolerance)
+            or _point_close(point, end, tolerance)
+        ):
+            degree += 1
+        else:
+            degree += 2
+    return degree
 
 
 @dataclass(frozen=True)
@@ -912,6 +962,8 @@ def decode_power_ports(
 def decode_global_labels(
     page: dict,
     wires: list[dict],
+    buses: list[dict],
+    components: list[dict],
     consumed_texts: set[tuple],
     consumed_lines: set[int],
 ) -> list[dict]:
@@ -928,23 +980,94 @@ def decode_global_labels(
             consumed_texts.add(_text_key(text))
 
     decoded = page.get("decoded") or {}
-    if not wires and not decoded.get("components"):
+    if not wires and not buses and not decoded.get("components"):
         return []
     labels = []
     seen = set()
     for label in pdf_dump.decode_global_labels(page):
         apex = (label["apex"]["x"], label["apex"]["y"])
         base = (label["base"]["x"], label["base"]["y"])
-        hotpoint = label.get("hotpoint")
-        if hotpoint:
-            point = (hotpoint["x"], hotpoint["y"])
+        direction = label["direction"]
+        line_indexes = [
+            index
+            for index in label.get("line_indexes", [])
+            if 0 <= index < len(page.get("lines", []))
+        ]
+        glyph_points = [
+            point
+            for line_index in line_indexes
+            for point in (
+                _point(page["lines"][line_index], 1),
+                _point(page["lines"][line_index], 2),
+            )
+        ]
+        text = label.get("text") or {}
+        if glyph_points and all(
+            key in text for key in ("x", "y", "x1", "y1")
+        ):
+            # Bidirectional Capture ports contain opposing chevrons.  The
+            # chevron nearest the text does not consistently point toward the
+            # text, so selecting an extreme from its direction alone can put
+            # the attachment one grid step onto the label body.  The wire is
+            # at the glyph extreme opposite the source text.
+            text_center = (
+                (text["x"] + text["x1"]) / 2,
+                (text["y"] + text["y1"]) / 2,
+            )
+            glyph_center = (
+                sum(point[0] for point in glyph_points) / len(glyph_points),
+                sum(point[1] for point in glyph_points) / len(glyph_points),
+            )
+            if direction in ("left", "right"):
+                text_is_positive = text_center[0] >= glyph_center[0]
+                point = (
+                    (
+                        min(point[0] for point in glyph_points)
+                        if text_is_positive
+                        else max(point[0] for point in glyph_points)
+                    ),
+                    apex[1],
+                )
+                direction = "right" if text_is_positive else "left"
+            else:
+                text_is_positive = text_center[1] >= glyph_center[1]
+                point = (
+                    apex[0],
+                    (
+                        min(point[1] for point in glyph_points)
+                        if text_is_positive
+                        else max(point[1] for point in glyph_points)
+                    ),
+                )
+                direction = "down" if text_is_positive else "up"
         else:
-            # Backward compatibility for decoder data without a complete glyph
-            # hotpoint.
-            point = (2 * base[0] - apex[0], 2 * base[1] - apex[1])
-        hit = _nearest_wire_point([point], wires, 0.2)
+            hotpoint = label.get("hotpoint")
+            if hotpoint:
+                point = (hotpoint["x"], hotpoint["y"])
+            else:
+                # Backward compatibility for decoder data without a complete
+                # glyph hotpoint.
+                point = (2 * base[0] - apex[0], 2 * base[1] - apex[1])
+
+        hit = _nearest_wire_point([point], wires, 0.25)
         if hit:
             point = hit[1]
+        else:
+            bus_hit = _nearest_wire_point([point], buses, 0.25)
+            if bus_hit:
+                point = bus_hit[1]
+            pins = [
+                (pin["hot"]["x"], pin["hot"]["y"])
+                for component in components
+                for pin in component["pins"]
+            ]
+            pin_hits = [
+                (_distance(point, pin), pin)
+                for pin in pins
+                if _distance(point, pin) <= 0.25
+            ]
+            if not bus_hit and pin_hits:
+                point = min(pin_hits, key=lambda candidate: candidate[0])[1]
         name = label["name"].upper()
         key = (name, round(point[0], 2), round(point[1], 2))
         if key in seen:
@@ -954,14 +1077,14 @@ def decode_global_labels(
             "left": 180,
             "up": 90,
             "down": 270,
-        }[label["direction"]]
+        }[direction]
         labels.append(
             {
                 "name": name,
                 "point": point,
                 "kind": "global",
                 "angle": angle,
-                "direction": label["direction"],
+                "direction": direction,
             }
         )
         seen.add(key)
@@ -980,6 +1103,147 @@ def decode_global_labels(
                 consumed_texts.add(_text_key(text))
                 break
     return labels
+
+
+def decode_junctions(
+    page: dict,
+    wires: list[dict],
+    consumed_curves: set[int],
+) -> list[tuple[float, float]]:
+    """Replace Capture's filled red PDF dots with native KiCad junctions."""
+    eligible = []
+    for index, curve in enumerate(page.get("curves", [])):
+        if (
+            curve.get("color") != JUNCTION_COLOR
+            or curve.get("fill") != JUNCTION_COLOR
+        ):
+            continue
+        bbox = _curve_bbox(curve)
+        if max(bbox["x1"] - bbox["x0"], bbox["y1"] - bbox["y0"]) > 1.0:
+            continue
+        eligible.append((index, bbox))
+
+    parent = list(range(len(eligible)))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(first, second):
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    order = sorted(
+        range(len(eligible)),
+        key=lambda item: eligible[item][1]["x0"],
+    )
+    for order_index, first in enumerate(order):
+        first_bbox = eligible[first][1]
+        for second in order[order_index + 1:]:
+            second_bbox = eligible[second][1]
+            if second_bbox["x0"] > first_bbox["x1"] + 0.06:
+                break
+            if _bboxes_touch(first_bbox, second_bbox, 0.06):
+                union(first, second)
+
+    groups = {}
+    for item in range(len(eligible)):
+        groups.setdefault(find(item), []).append(item)
+
+    endpoints = {
+        (wire[end]["x"], wire[end]["y"])
+        for wire in wires
+        for end in ("start", "end")
+    }
+    junctions = []
+    seen = set()
+    for group in groups.values():
+        if len(group) < 4:
+            continue
+        bboxes = [eligible[item][1] for item in group]
+        bbox = {
+            "x0": min(candidate["x0"] for candidate in bboxes),
+            "y0": min(candidate["y0"] for candidate in bboxes),
+            "x1": max(candidate["x1"] for candidate in bboxes),
+            "y1": max(candidate["y1"] for candidate in bboxes),
+        }
+        width = bbox["x1"] - bbox["x0"]
+        height = bbox["y1"] - bbox["y0"]
+        if (
+            not 0.15 <= width <= 1.2
+            or not 0.15 <= height <= 1.2
+            or not 0.65 <= width / height <= 1.55
+        ):
+            continue
+        center = (
+            (bbox["x0"] + bbox["x1"]) / 2,
+            (bbox["y0"] + bbox["y1"]) / 2,
+        )
+        candidates = sorted(
+            (
+                (_distance(center, endpoint), endpoint)
+                for endpoint in endpoints
+                if _distance(center, endpoint) <= max(width, height) * 0.8
+            ),
+            key=lambda candidate: candidate[0],
+        )
+        point = next(
+            (
+                candidate
+                for _distance_to_center, candidate in candidates
+                if _wire_degree(candidate, wires) >= 3
+            ),
+            None,
+        )
+        if point is None:
+            continue
+        key = (round(point[0], 3), round(point[1], 3))
+        if key in seen:
+            consumed_curves.update(eligible[item][0] for item in group)
+            continue
+        seen.add(key)
+        junctions.append(point)
+        consumed_curves.update(eligible[item][0] for item in group)
+    junctions.sort(key=lambda point: (point[1], point[0]))
+    return junctions
+
+
+def decode_buses(page: dict) -> list[dict]:
+    """Decode Capture's blue bus segments without treating entries as wires."""
+    buses = []
+    seen = set()
+    for line in page.get("lines", []):
+        if line.get("color") != BUS_COLOR:
+            continue
+        start = _point(line, 1)
+        end = _point(line, 2)
+        key = tuple(
+            round(value, 2)
+            for point in sorted((start, end))
+            for value in point
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        buses.append(
+            {
+                "start": {"x": start[0], "y": start[1]},
+                "end": {"x": end[0], "y": end[1]},
+            }
+        )
+    buses.sort(
+        key=lambda bus: (
+            bus["start"]["y"],
+            bus["start"]["x"],
+            bus["end"]["y"],
+            bus["end"]["x"],
+        )
+    )
+    return buses
 
 
 def decode_local_labels(
@@ -1045,7 +1309,10 @@ def decode_local_labels(
 def decode_page(page: dict) -> dict:
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
     wires = decoded["wires"]
+    buses = decode_buses(page)
     components, consumed_texts, semantic_lines = decode_components(page)
+    semantic_curves = set()
+    junctions = decode_junctions(page, wires, semantic_curves)
     power_ports = decode_power_ports(
         page,
         wires,
@@ -1056,13 +1323,14 @@ def decode_page(page: dict) -> dict:
     global_labels = decode_global_labels(
         page,
         wires,
+        buses,
+        components,
         consumed_texts,
         semantic_lines,
     )
     local_labels = decode_local_labels(page, wires, consumed_texts)
     worksheet = decoded.get("worksheet")
     semantic_rectangles = set()
-    semantic_curves = set()
     if worksheet:
         semantic_lines.update(worksheet.get("line_indexes", []))
         semantic_rectangles.update(worksheet.get("rectangle_indexes", []))
@@ -1075,6 +1343,8 @@ def decode_page(page: dict) -> dict:
     return {
         "components": components,
         "wires": wires,
+        "buses": buses,
+        "junctions": junctions,
         "power_ports": power_ports,
         "global_labels": global_labels,
         "local_labels": local_labels,
@@ -1211,6 +1481,30 @@ def _wire(factory, transform, wire) -> str:
         f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))\n"
         "\t\t(stroke (width 0) (type default))\n"
         f'\t\t(uuid "{factory.new("wire")}")\n'
+        "\t)\n"
+    )
+
+
+def _junction(factory, transform, point) -> str:
+    x, y = transform.xy(*point)
+    return (
+        "\t(junction\n"
+        f"\t\t(at {x:.2f} {y:.2f})\n"
+        "\t\t(diameter 0)\n"
+        "\t\t(color 0 0 0 0)\n"
+        f'\t\t(uuid "{factory.new("junction")}")\n'
+        "\t)\n"
+    )
+
+
+def _bus(factory, transform, bus) -> str:
+    x1, y1 = transform.xy(bus["start"]["x"], bus["start"]["y"])
+    x2, y2 = transform.xy(bus["end"]["x"], bus["end"]["y"])
+    return (
+        "\t(bus\n"
+        f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))\n"
+        "\t\t(stroke (width 0) (type default))\n"
+        f'\t\t(uuid "{factory.new("bus")}")\n'
         "\t)\n"
     )
 
@@ -1530,7 +1824,11 @@ def _component_instance(
             (ref_text["y"] + ref_text["y1"]) / 2,
         )
         ref_angle = int(round(ref_text.get("angle", 0))) % 180
-        ref_size = max(0.8, transform.delta(ref_text.get("size") or 1.27))
+        ref_size = max(
+            0.8,
+            transform.delta(ref_text.get("size") or 1.27)
+            / KICAD_OUTLINE_FONT_COMPENSATION,
+        )
     else:
         ref_at = (x, y - 2.54)
         ref_angle = 0
@@ -1542,7 +1840,11 @@ def _component_instance(
             (value_text["y"] + value_text["y1"]) / 2,
         )
         value_angle = int(round(value_text.get("angle", 0))) % 180
-        value_size = max(0.8, transform.delta(value_text.get("size") or 1.27))
+        value_size = max(
+            0.8,
+            transform.delta(value_text.get("size") or 1.27)
+            / KICAD_OUTLINE_FONT_COMPENSATION,
+        )
     else:
         value_at = (x, y + 2.54)
         value_angle = 0
@@ -1550,6 +1852,8 @@ def _component_instance(
     reference = _esc(component["reference"])
     value = _esc(component["value"])
     unit = component.get("unit", 1)
+    ref_style = _text_font_style(ref_text or {})
+    value_style = _text_font_style(value_text or {})
     parts = [
         "\t(symbol\n",
         f'\t\t(lib_id "{lib_id}")\n',
@@ -1562,11 +1866,13 @@ def _component_instance(
         f'\t\t(uuid "{factory.new("symbol")}")\n',
         f'\t\t(property "Reference" "{reference}"\n',
         f"\t\t\t(at {ref_at[0]:.2f} {ref_at[1]:.2f} {ref_angle})\n",
-        f"\t\t\t(effects (font (size {ref_size:.2f} {ref_size:.2f})))\n",
+        f'\t\t\t(effects (font (face "{ORCAD_TEXT_FACE}") '
+        f"(size {ref_size:.2f} {ref_size:.2f}){ref_style}))\n",
         "\t\t)\n",
         f'\t\t(property "Value" "{value}"\n',
         f"\t\t\t(at {value_at[0]:.2f} {value_at[1]:.2f} {value_angle})\n",
-        f"\t\t\t(effects (font (size {value_size:.2f} {value_size:.2f})))\n",
+        f'\t\t\t(effects (font (face "{ORCAD_TEXT_FACE}") '
+        f"(size {value_size:.2f} {value_size:.2f}){value_style}))\n",
         "\t\t)\n",
     ]
     for pin in component["pins"]:
@@ -1645,15 +1951,39 @@ def _graphic_curve(factory, transform, curve) -> str:
     )
 
 
+def _text_font_style(text: dict) -> str:
+    styles = []
+    if text.get("bold"):
+        styles.append("(bold yes)")
+    if text.get("italic"):
+        styles.append("(italic yes)")
+    return (" " + " ".join(styles)) if styles else ""
+
+
 def _graphic_text(factory, transform, text) -> str:
     x, y = transform.xy(text["x"], text["y1"])
-    size = max(0.5, transform.delta(text.get("size") or 1.0))
+    size = max(
+        0.5,
+        transform.delta(text.get("size") or 1.0)
+        / KICAD_OUTLINE_FONT_COMPENSATION,
+    )
     angle = int(round(text.get("angle", 0))) % 360
+    nudge = 0.2 * size
+    if angle == 0:
+        y += nudge
+    elif angle == 90:
+        x += nudge
+    elif angle == 180:
+        y -= nudge
+    elif angle == 270:
+        x -= nudge
+    style_part = _text_font_style(text)
     return (
         f'\t(text "{_esc(text["text"])}"\n'
         "\t\t(exclude_from_sim no)\n"
         f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
-        f"\t\t(effects (font (size {size:.2f} {size:.2f}) "
+        f'\t\t(effects (font (face "{ORCAD_TEXT_FACE}") '
+        f"(size {size:.2f} {size:.2f}){style_part} "
         f"(color {_rgba(text.get('color'))})) (justify left bottom))\n"
         f'\t\t(uuid "{factory.new("graphic-text")}")\n'
         "\t)\n"
@@ -1723,6 +2053,10 @@ def render_page(
 
     for wire in semantic["wires"]:
         parts.append(_wire(factory, transform, wire))
+    for bus in semantic.get("buses", []):
+        parts.append(_bus(factory, transform, bus))
+    for junction in semantic.get("junctions", []):
+        parts.append(_junction(factory, transform, junction))
     for component, lib_id in zip(semantic["components"], lib_ids):
         parts.append(
             _component_instance(
@@ -1750,7 +2084,7 @@ def render_page(
     if keep_graphics:
         for index, line in enumerate(page["lines"]):
             if (
-                line.get("color") == WIRE_COLOR
+                line.get("color") in (WIRE_COLOR, BUS_COLOR)
                 or index in semantic["semantic_lines"]
             ):
                 continue
@@ -1994,6 +2328,8 @@ def convert_pdf(
                 "sheet_file": page_filename,
                 "paper": selected_paper,
                 "wires": len(semantic["wires"]),
+                "buses": len(semantic["buses"]),
+                "junctions": len(semantic["junctions"]),
                 "components": len(semantic["components"]),
                 "pins": sum(
                     len(component["pins"])
@@ -2098,6 +2434,8 @@ def main() -> None:
         for page in summary["pages"]:
             print(
                 f"  [{page['page']:2d}] {page['wires']} wires, "
+                f"{page['buses']} buses, "
+                f"{page['junctions']} junctions, "
                 f"{page['components']} components, {page['pins']} pins, "
                 f"{page['local_labels']} local labels, "
                 f"{page['global_labels']} global labels, "

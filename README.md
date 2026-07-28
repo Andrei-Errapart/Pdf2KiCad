@@ -2,8 +2,9 @@
 
 `pdf2kicad` reconstructs an editable KiCad schematic project from an
 OrCAD/Capture-generated PDF. It builds on `scripts/pdf_dump.py` and recovers
-the PDF's colored schematic geometry as KiCad wires, generic symbols and pins,
-local/global labels, power ports, and sequential multi-unit designators.
+the PDF's colored schematic geometry as KiCad wires and buses, native
+junctions, generic symbols and pins, local/global labels, power ports, and
+sequential multi-unit designators.
 
 PDF is a presentation format, not a schematic database. Library identities,
 hidden fields, multi-unit relationships, electrical pin types, and some pin
@@ -25,7 +26,10 @@ sequences remain separate components.
 
 OrCAD off-page ports become native KiCad global labels. Their connector
 direction controls the KiCad orientation so the label body extends away from
-its wire, and the consumed PDF text/chevron is omitted from residual graphics.
+and attaches to its wire or bus, and the consumed PDF text/chevron is omitted
+from residual graphics. Compact filled connection dots become native KiCad
+junctions. Recovered PDF text uses its source bold/italic style and an
+Arial-compatible outline font with KiCad's font-size compensation.
 
 ## Usage
 
