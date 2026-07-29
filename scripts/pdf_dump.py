@@ -52,7 +52,7 @@ CHEVRON_MIN_ARM = 0.25
 CHEVRON_MAX_ARM = 3.0
 CHEVRON_POINT_TOL = 0.12
 REF_RE = re.compile(
-    r"^(?:U|CN|J|P|R|C|LD|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SP|X|F|VR)\d+[A-Z]?$"
+    r"^(?:U|CN|PCIE|JSW|J|P|R|C|LD|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SP|X|F|VR)\d+[A-Z]?$"
 )
 
 
@@ -141,6 +141,103 @@ def _point_in_rect_margin(x: float, y: float, bbox: dict, margin: float) -> bool
         bbox["x0"] - margin <= x <= bbox["x1"] + margin
         and bbox["y0"] - margin <= y <= bbox["y1"] + margin
     )
+
+
+def _curve_bbox(curve: dict) -> dict:
+    points = curve["points"]
+    return {
+        "x0": min(point[0] for point in points),
+        "y0": min(point[1] for point in points),
+        "x1": max(point[0] for point in points),
+        "y1": max(point[1] for point in points),
+    }
+
+
+def _bbox_distance(first: dict, second: dict) -> float:
+    dx = max(
+        first["x0"] - second["x1"],
+        second["x0"] - first["x1"],
+        0.0,
+    )
+    dy = max(
+        first["y0"] - second["y1"],
+        second["y0"] - first["y1"],
+        0.0,
+    )
+    return math.hypot(dx, dy)
+
+
+def _point_to_bbox_distance(point, bbox: dict) -> float:
+    dx = max(bbox["x0"] - point[0], point[0] - bbox["x1"], 0.0)
+    dy = max(bbox["y0"] - point[1], point[1] - bbox["y1"], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _bboxes_touch(first: dict, second: dict, tolerance: float) -> bool:
+    return _bbox_distance(first, second) <= tolerance
+
+
+def _inverted_pin_bubbles(bbox: dict, curves: list[dict]) -> list[dict]:
+    """Return small white pin-colored curve groups touching a symbol body."""
+    remaining = [
+        (index, curve, _curve_bbox(curve))
+        for index, curve in enumerate(curves)
+        if (
+            curve.get("color") == PIN_COLOR
+            and curve.get("fill") == "#ffffff"
+            and curve.get("points")
+        )
+    ]
+    groups = []
+    while remaining:
+        index, curve, curve_bbox = remaining.pop()
+        indexes = [index]
+        group_bbox = curve_bbox
+        changed = True
+        while changed:
+            changed = False
+            for candidate in list(remaining):
+                next_index, _next_curve, next_bbox = candidate
+                if not _bboxes_touch(group_bbox, next_bbox, GEOM_TOL):
+                    continue
+                indexes.append(next_index)
+                group_bbox = {
+                    "x0": min(group_bbox["x0"], next_bbox["x0"]),
+                    "y0": min(group_bbox["y0"], next_bbox["y0"]),
+                    "x1": max(group_bbox["x1"], next_bbox["x1"]),
+                    "y1": max(group_bbox["y1"], next_bbox["y1"]),
+                }
+                remaining.remove(candidate)
+                changed = True
+        width = group_bbox["x1"] - group_bbox["x0"]
+        height = group_bbox["y1"] - group_bbox["y0"]
+        if (
+            len(indexes) >= 2
+            and 0.25 <= width <= 1.5
+            and 0.25 <= height <= 1.5
+            and max(width, height) <= min(width, height) * 1.6
+            and _bbox_distance(group_bbox, bbox) <= EDGE_TOL
+        ):
+            groups.append({
+                "bbox": group_bbox,
+                "curve_indexes": sorted(indexes),
+            })
+    return groups
+
+
+def _body_edge_from_hot(hot, bbox: dict):
+    candidates = []
+    if hot[0] < bbox["x0"]:
+        candidates.append((bbox["x0"] - hot[0], (bbox["x0"], hot[1])))
+    if hot[0] > bbox["x1"]:
+        candidates.append((hot[0] - bbox["x1"], (bbox["x1"], hot[1])))
+    if hot[1] < bbox["y0"]:
+        candidates.append((bbox["y0"] - hot[1], (hot[0], bbox["y0"])))
+    if hot[1] > bbox["y1"]:
+        candidates.append((hot[1] - bbox["y1"], (hot[0], bbox["y1"])))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _merged_coverage(segments, start: float, end: float) -> float:
@@ -326,7 +423,14 @@ def _text_center(text: dict) -> tuple[float, float]:
 
 
 def _nearest_reference(bbox: dict, texts: list[dict]) -> dict | None:
-    refs = [t for t in texts if REF_RE.match(t.get("text", ""))]
+    refs = [
+        text
+        for text in texts
+        if (
+            text.get("color") == "#000000"
+            and REF_RE.match(text.get("text", ""))
+        )
+    ]
     if not refs:
         return None
 
@@ -505,10 +609,13 @@ def _pins_for_body(
     lines: list[dict],
     texts: list[dict],
     reference_text: dict | None = None,
+    curves: list[dict] | None = None,
 ) -> list[dict]:
     pins = []
     center = ((bbox["x0"] + bbox["x1"]) / 2, (bbox["y0"] + bbox["y1"]) / 2)
     seen = set()
+    inverted_bubbles = _inverted_pin_bubbles(bbox, curves or [])
+    used_bubbles = set()
     pin_number_texts = _pin_number_candidates(texts)
     pin_name_texts = _pin_name_candidates(texts)
     if reference_text:
@@ -520,7 +627,7 @@ def _pins_for_body(
                 and abs(text["y"] - reference_text["y"]) <= GEOM_TOL
             )
         ]
-    for line in lines:
+    for line_index, line in enumerate(lines):
         if line.get("color") != PIN_COLOR:
             continue
         length = _line_length(line)
@@ -529,17 +636,47 @@ def _pins_for_body(
         p0, p1 = _line_points(line)
         d0 = _dist_point_to_rect_edge(p0[0], p0[1], bbox)
         d1 = _dist_point_to_rect_edge(p1[0], p1[1], bbox)
+        inverted = None
         if min(d0, d1) > EDGE_TOL:
-            continue
+            for bubble_index, bubble in enumerate(inverted_bubbles):
+                if bubble_index in used_bubbles:
+                    continue
+                bubble_bbox = bubble["bbox"]
+                point_distances = [
+                    _point_to_bbox_distance(p0, bubble_bbox),
+                    _point_to_bbox_distance(p1, bubble_bbox),
+                ]
+                if min(point_distances) > GEOM_TOL:
+                    continue
+                stub_index = min(
+                    range(2),
+                    key=lambda index: point_distances[index],
+                )
+                hot = (p0, p1)[1 - stub_index]
+                other = _body_edge_from_hot(hot, bbox)
+                if (
+                    other is None
+                    or _point_to_bbox_distance(other, bubble_bbox)
+                    > EDGE_TOL
+                ):
+                    continue
+                inverted = (hot, other, bubble_index, bubble)
+                break
+            if inverted is None:
+                continue
         if not (
             _point_in_rect_margin(p0[0], p0[1], bbox, 8.0)
             or _point_in_rect_margin(p1[0], p1[1], bbox, 8.0)
         ):
             continue
 
-        c0 = math.hypot(p0[0] - center[0], p0[1] - center[1])
-        c1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
-        other, hot = (p0, p1) if c0 <= c1 else (p1, p0)
+        if inverted:
+            hot, other, bubble_index, bubble = inverted
+            used_bubbles.add(bubble_index)
+        else:
+            c0 = math.hypot(p0[0] - center[0], p0[1] - center[1])
+            c1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
+            other, hot = (p0, p1) if c0 <= c1 else (p1, p0)
         key = (round(hot[0], 2), round(hot[1], 2), round(other[0], 2), round(other[1], 2))
         if key in seen:
             continue
@@ -547,8 +684,16 @@ def _pins_for_body(
         pin = {
             "hot": _point_dict(hot),
             "other": _point_dict(other),
-            "length": _round_coord(length),
+            "length": _round_coord(
+                math.hypot(hot[0] - other[0], hot[1] - other[1])
+                if inverted
+                else length
+            ),
+            "line_index": line_index,
         }
+        if inverted:
+            pin["graphic_style"] = "inverted"
+            pin["curve_indexes"] = bubble["curve_indexes"]
         pin["side"] = _pin_orientation(pin)
         pins.append(pin)
     pins.sort(key=lambda p: (p["side"], p["hot"]["y"], p["hot"]["x"]))
@@ -1529,7 +1674,13 @@ def decode_page(page_data: dict) -> dict:
     components = []
     for bbox in _find_body_rectangles(page_data["lines"], page_data["rectangles"]):
         ref = _nearest_reference(bbox, page_data["texts"])
-        pins = _pins_for_body(bbox, page_data["lines"], page_data["texts"], ref)
+        pins = _pins_for_body(
+            bbox,
+            page_data["lines"],
+            page_data["texts"],
+            ref,
+            page_data["curves"],
+        )
         promoted_pin_names = _promote_numeric_pin_names(pins)
         components.append({
             "reference": ref["text"] if ref else None,
