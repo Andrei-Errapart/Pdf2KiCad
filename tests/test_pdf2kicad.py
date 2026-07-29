@@ -61,6 +61,27 @@ class CoordinateTransformTests(unittest.TestCase):
         self.assertEqual(pdf2kicad.detect_paper([page], "auto"), "A3")
         self.assertEqual(pdf2kicad.detect_paper([page], "A2"), "A2")
 
+    def test_symbol_local_point_preserves_rounded_absolute_hotpoint(self):
+        transform = pdf2kicad.coordinate_transform("A2")
+        origin = (231.119, 13.6525)
+        hotpoint = (227.33, 13.97)
+
+        local_x, local_y = pdf2kicad._symbol_local_point(
+            transform,
+            origin,
+            hotpoint,
+        )
+        origin_x, origin_y = transform.xy(*origin)
+
+        self.assertEqual((local_x, local_y), (-7.58, -0.63))
+        self.assertEqual(
+            (
+                round(origin_x + local_x, 2),
+                round(origin_y - local_y, 2),
+            ),
+            transform.xy(*hotpoint),
+        )
+
 
 class SheetNamingTests(unittest.TestCase):
     @staticmethod
@@ -414,6 +435,27 @@ class SemanticRecoveryTests(unittest.TestCase):
         self.assertEqual(consumed_lines, {0, 1, 2, 3})
         self.assertIn(pdf2kicad._text_key(reference), consumed_texts)
 
+    def test_body_stub_touching_edge_interior_stays_with_symbol(self):
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 10.0, 15.0, 20.0, 10.0),
+                line(pdf2kicad.BODY_COLOR, 20.0, 10.0, 20.0, 20.0),
+                line(pdf2kicad.BODY_COLOR, 20.0, 20.0, 10.0, 15.0),
+                # This endpoint lands on the middle of the sloped edge.
+                line(pdf2kicad.BODY_COLOR, 16.0, 12.0, 16.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 7.0, 15.0, 10.0, 15.0),
+                line(pdf2kicad.PIN_COLOR, 20.0, 15.0, 23.0, 15.0),
+                line(pdf2kicad.PIN_COLOR, 16.0, 8.0, 16.0, 10.0),
+            ],
+            "curves": [],
+        }
+
+        clusters = pdf2kicad._geometry_clusters(page, set())
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(len(clusters[0]["body_lines"]), 4)
+        self.assertEqual(len(clusters[0]["pin_lines"]), 3)
+
     def test_directly_connected_resistor_and_laser_diode_stay_separate(self):
         r296 = self.semantic_text("R296", 11.0, 10.0, 14.0, 11.0)
         ld7 = self.semantic_text("LD7", 11.0, 17.0, 13.0, 18.0)
@@ -551,6 +593,335 @@ class SemanticRecoveryTests(unittest.TestCase):
         )
         for number_text in number_texts:
             self.assertIn(pdf2kicad._text_key(number_text), consumed_texts)
+
+    def test_matching_maximizes_cardinality_before_minimizing_cost(self):
+        pairs = pdf2kicad._maximum_cardinality_pairs([
+            (1.0, 0, 0),
+            (2.0, 0, 1),
+            (2.0, 1, 0),
+            (100.0, 1, 1),
+        ])
+
+        self.assertEqual(
+            {(cluster, text) for _score, cluster, text in pairs},
+            {(0, 1), (1, 0)},
+        )
+
+    def test_spacer_pin_stub_connects_to_its_wire(self):
+        reference = self.semantic_text("SP1", 10.0, 7.0, 12.0, 8.0)
+        number = self.semantic_text("1", 14.0, 11.0, 15.0, 12.0)
+        source_component = {
+            "reference": "SP1",
+            "reference_text": reference,
+            "bbox": {
+                "x0": 10.0,
+                "y0": 10.0,
+                "x1": 13.0,
+                "y1": 13.0,
+            },
+            "pins": [],
+        }
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 10.0, 11.5, 13.0, 11.5),
+                line(pdf2kicad.PIN_COLOR, 14.0, 11.5, 15.0, 11.5),
+            ],
+            "rectangles": [],
+            "curves": [],
+            "texts": [reference, number],
+            "decoded": {
+                "components": [source_component],
+                "wires": [{
+                    "start": {"x": 15.0, "y": 11.5},
+                    "end": {"x": 18.0, "y": 11.5},
+                    "length": 3.0,
+                }],
+            },
+        }
+
+        components, _consumed_texts, consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+        recovered = components[0]
+
+        self.assertEqual(
+            recovered["pins"],
+            [{
+                "hot": {"x": 15.0, "y": 11.5},
+                "other": {"x": 14.0, "y": 11.5},
+                "length": 1.0,
+                "number": "1",
+                "line_index": 1,
+            }],
+        )
+        self.assertEqual(consumed_lines, {0, 1})
+
+    def test_passive_value_can_be_a_rotated_vendor_part_number(self):
+        reference = self.semantic_text("R1", 8.0, 9.0, 9.0, 12.0, 90)
+        value = self.semantic_text(
+            "CRF0805-FZ-R001ELF",
+            10.0,
+            13.5,
+            19.0,
+            14.5,
+        )
+        source_component = component("R1")
+        source_component["reference_text"] = reference
+        source_component["bbox"] = {
+            "x0": 10.0,
+            "y0": 10.0,
+            "x1": 12.0,
+            "y1": 12.0,
+        }
+        consumed_texts = {pdf2kicad._text_key(reference)}
+        page = {
+            "texts": [reference, value],
+            "decoded": {"wires": []},
+        }
+
+        pdf2kicad.assign_values(
+            page,
+            [source_component],
+            consumed_texts,
+        )
+
+        self.assertEqual(source_component["value"], value["text"])
+        self.assertIs(source_component["value_text"], value)
+        self.assertIn(pdf2kicad._text_key(value), consumed_texts)
+
+    def test_pin_name_overline_becomes_native_negation(self):
+        name_text = {
+            **self.semantic_text("CTS", 10.5, 11.5, 13.0, 12.5),
+            "color": pdf2kicad.PIN_NAME_COLOR,
+        }
+        source_component = component("U1")
+        source_component["pins"][0]["name"] = "CTS"
+        source_component["pins"][0]["name_text"] = name_text
+        source_component["line_indexes"] = set()
+        page = {
+            "lines": [
+                line(
+                    pdf2kicad.PIN_NAME_COLOR,
+                    10.5,
+                    11.43,
+                    13.0,
+                    11.43,
+                ),
+            ],
+        }
+
+        consumed = pdf2kicad._recover_negated_pin_names(
+            page,
+            source_component,
+        )
+        rendered = pdf2kicad._symbol_definition(
+            pdf2kicad.UuidFactory(b"negated-pin-name"),
+            pdf2kicad.coordinate_transform("A4"),
+            source_component,
+            "pdf2kicad:U1",
+        )
+
+        self.assertEqual(source_component["pins"][0]["name"], "~{CTS}")
+        self.assertEqual(consumed, {0})
+        self.assertEqual(source_component["line_indexes"], {0})
+        self.assertIn('(name "~{CTS}"', rendered)
+
+    def test_bubbled_overlined_pin_becomes_native_inverted_pin(self):
+        reference = self.semantic_text("U28", 10.45, 7.0, 12.5, 8.0)
+        number = self.semantic_text("15", 9.0, 14.0, 10.2, 15.0)
+        name = {
+            **self.semantic_text("1OE", 11.0, 14.5, 13.5, 15.5),
+            "color": pdf2kicad.PIN_NAME_COLOR,
+        }
+        page = {
+            "width": 100.0,
+            "height": 80.0,
+            "lines": [
+                line(pdf2kicad.PIN_COLOR, 7.0, 15.0, 9.6, 15.0),
+                line(
+                    pdf2kicad.PIN_NAME_COLOR,
+                    11.0,
+                    14.43,
+                    13.5,
+                    14.43,
+                ),
+            ],
+            "rectangles": [{
+                "x0": 10.45,
+                "y0": 10.0,
+                "x1": 20.0,
+                "y1": 20.0,
+                "color": pdf2kicad.BODY_COLOR,
+                "fill": None,
+                "width": 0.1,
+            }],
+            "curves": [
+                {
+                    "points": points,
+                    "color": pdf2kicad.PIN_COLOR,
+                    "fill": "#ffffff",
+                    "width": 0.1,
+                }
+                for points in (
+                    [[9.6, 15.0], [10.0, 14.6]],
+                    [[10.0, 14.6], [10.4, 15.0]],
+                    [[10.4, 15.0], [10.0, 15.4]],
+                    [[10.0, 15.4], [9.6, 15.0]],
+                )
+            ],
+            "texts": [reference, number, name],
+        }
+
+        components, consumed_texts, consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+        recovered = components[0]
+        pin = recovered["pins"][0]
+        recovered["value"] = "Example"
+        rendered = pdf2kicad._symbol_definition(
+            pdf2kicad.UuidFactory(b"inverted-pin"),
+            pdf2kicad.coordinate_transform("A4"),
+            recovered,
+            "pdf2kicad:U28",
+        )
+
+        self.assertEqual(pin["number"], "15")
+        self.assertEqual(pin["name"], "~{1OE}")
+        self.assertEqual(pin["graphic_style"], "inverted")
+        self.assertEqual(pin["hot"], {"x": 7.0, "y": 15.0})
+        self.assertEqual(pin["other"], {"x": 10.45, "y": 15.0})
+        self.assertEqual(recovered["curve_indexes"], {0, 1, 2, 3})
+        self.assertEqual(consumed_lines, {0, 1})
+        self.assertIn(pdf2kicad._text_key(number), consumed_texts)
+        self.assertIn(pdf2kicad._text_key(name), consumed_texts)
+        self.assertIn("(pin passive inverted", rendered)
+        self.assertIn('(name "~{1OE}"', rendered)
+
+    def test_rotated_reference_bank_prefers_body_after_own_text(self):
+        references = [
+            self.semantic_text(value, x, 10.0, x + 1.0, 13.0, 90)
+            for value, x in (
+                ("R304", 6.3),
+                ("R305", 11.3),
+                ("C648", 16.3),
+                ("C649", 21.3),
+            )
+        ]
+        page_lines = []
+        for x in (10.0, 15.0, 20.0, 25.0):
+            page_lines.extend([
+                line(pdf2kicad.BODY_COLOR, x, 10.0, x, 12.0),
+                line(pdf2kicad.PIN_COLOR, x, 8.0, x, 10.0),
+                line(pdf2kicad.PIN_COLOR, x, 12.0, x, 14.0),
+            ])
+        page = {
+            "lines": page_lines,
+            "rectangles": [],
+            "curves": [],
+            "texts": references,
+            "decoded": {"components": [], "wires": []},
+        }
+
+        components, _consumed_texts, _consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+        centers = {
+            item["reference"]: round(
+                (item["bbox"]["x0"] + item["bbox"]["x1"]) / 2,
+                1,
+            )
+            for item in components
+        }
+
+        self.assertEqual(
+            centers,
+            {
+                "R304": 10.0,
+                "R305": 15.0,
+                "C648": 20.0,
+                "C649": 25.0,
+            },
+        )
+
+    def test_jsw_reference_and_value_use_switch_body(self):
+        reference = self.semantic_text("JSW1", 10.0, 15.5, 13.0, 16.5)
+        duplicate_reference = self.semantic_text(
+            "JSW1",
+            2.0,
+            25.0,
+            5.0,
+            26.0,
+        )
+        value = self.semantic_text(
+            "CJS-1200A1",
+            10.0,
+            17.0,
+            16.0,
+            18.0,
+        )
+        decoy_reference = self.semantic_text(
+            "DSW3",
+            25.0,
+            10.0,
+            28.0,
+            11.0,
+        )
+        page = {
+            "width": 100.0,
+            "height": 80.0,
+            "lines": [
+                line(pdf2kicad.PIN_COLOR, 8.0, 11.0, 10.0, 11.0),
+                line(pdf2kicad.PIN_COLOR, 8.0, 14.0, 10.0, 14.0),
+                line(pdf2kicad.PIN_COLOR, 15.0, 12.5, 17.0, 12.5),
+                line(pdf2kicad.WIRE_COLOR, 40.0, 40.0, 50.0, 40.0),
+            ],
+            "rectangles": [{
+                "x0": 10.0,
+                "y0": 10.0,
+                "x1": 15.0,
+                "y1": 15.0,
+                "color": pdf2kicad.BODY_COLOR,
+                "fill": None,
+                "width": 0.1,
+            }],
+            "curves": [],
+            "texts": [
+                duplicate_reference,
+                decoy_reference,
+                value,
+                reference,
+            ],
+        }
+
+        components, consumed_texts, _consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+        pdf2kicad.assign_values(page, components, consumed_texts)
+        switches = [
+            item for item in components if item["reference"] == "JSW1"
+        ]
+
+        self.assertIsNotNone(pdf2kicad.REF_RE.fullmatch("JSW1"))
+        self.assertIsNotNone(pdf2kicad.REF_RE.fullmatch("PCIE1"))
+        self.assertEqual(len(switches), 1)
+        self.assertEqual(len(switches[0]["pins"]), 3)
+        self.assertEqual(switches[0]["value"], "CJS-1200A1")
+        self.assertIs(switches[0]["value_text"], value)
+
+    def test_black_reference_wins_over_blue_pin_name(self):
+        body = {"x0": 10.0, "y0": 10.0, "x1": 25.0, "y1": 20.0}
+        pin_name = {
+            **self.semantic_text("D1", 23.0, 12.0, 24.0, 13.0),
+            "color": pdf2kicad.PIN_NAME_COLOR,
+        }
+        reference = self.semantic_text("Q5", 18.0, 18.0, 20.0, 19.0)
+
+        recovered = pdf2kicad.pdf_dump._nearest_reference(
+            body,
+            [pin_name, reference],
+        )
+
+        self.assertEqual(recovered["text"], "Q5")
 
     def test_capacitor_plates_are_consumed_into_symbol_body(self):
         reference = {
@@ -2089,6 +2460,31 @@ class GlobalLabelTests(unittest.TestCase):
 
 
 class LocalLabelTests(unittest.TestCase):
+    def test_hash_suffix_is_valid_in_a_local_label(self):
+        label = {
+            "text": "PMIC_INT#",
+            "x": 10.0,
+            "y": 8.5,
+            "x1": 15.0,
+            "y1": 9.5,
+            "size": 1.0,
+            "angle": 0,
+            "color": "#000000",
+        }
+        wire = {
+            "start": {"x": 9.0, "y": 9.66},
+            "end": {"x": 18.0, "y": 9.66},
+        }
+
+        labels = pdf2kicad.decode_local_labels(
+            {"texts": [label]},
+            [wire],
+            set(),
+        )
+
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0]["name"], "PMIC_INT#")
+
     def test_baseline_wire_wins_over_nearby_diagonal_bus_entry(self):
         label = {
             "text": "DDR0_DQB15",

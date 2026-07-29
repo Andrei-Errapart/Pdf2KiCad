@@ -45,12 +45,14 @@ import pdf_dump
 KICAD_VERSION = 20260306
 BODY_COLOR = pdf_dump.BODY_COLOR
 PIN_COLOR = pdf_dump.PIN_COLOR
+PIN_NAME_COLOR = pdf_dump.PIN_NAME_COLOR
 WIRE_COLOR = pdf_dump.WIRE_COLOR
 BUS_COLOR = "#0000ff"
 REF_RE = pdf_dump.REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
 BODY_CURVE_JOIN_TOL = 0.06
 BODY_HALF_JOIN_TOL = 1.5
+REFERENCE_DIRECTION_TOL = 0.8
 JUNCTION_COLOR = "#ff0000"
 NO_CONNECT_COLOR = "#803f00"
 # KiCad applies this scale internally when it renders an outline font.  OrCAD
@@ -58,7 +60,7 @@ NO_CONNECT_COLOR = "#803f00"
 # so divide the PDF em size before emitting a KiCad `(size ...)`.
 KICAD_OUTLINE_FONT_COMPENSATION = 1.4
 ORCAD_TEXT_FACE = "Arial"
-LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+\-\[\]<>:]*$")
+LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
 MULTI_UNIT_REF_RE = re.compile(r"^(U\d+)([A-Z])$")
@@ -583,6 +585,85 @@ def _geometry_clusters(
                 union(record_index, other)
             endpoints.setdefault(key, []).append(record_index)
 
+    # Some Capture symbols terminate a short body-colored pin extension on
+    # the middle of a sloped body edge.  Endpoint-only grouping splits those
+    # extensions (and their electrical pins) away from the symbol body.  Only
+    # merge that precise pattern: one end touches the interior of another
+    # body segment and the free end is attached to a pin-colored line.
+    pin_endpoint_buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for line in page["lines"]:
+        if line.get("color") != PIN_COLOR:
+            continue
+        for point in (_point(line, 1), _point(line, 2)):
+            key = (
+                round(point[0] / tolerance),
+                round(point[1] / tolerance),
+            )
+            pin_endpoint_buckets.setdefault(key, []).append(point)
+
+    def touches_pin_endpoint(point: tuple[float, float]) -> bool:
+        key = (
+            round(point[0] / tolerance),
+            round(point[1] / tolerance),
+        )
+        return any(
+            _point_close(point, candidate, tolerance)
+            for x_offset in (-1, 0, 1)
+            for y_offset in (-1, 0, 1)
+            for candidate in pin_endpoint_buckets.get(
+                (key[0] + x_offset, key[1] + y_offset),
+                [],
+            )
+        )
+
+    def is_pin_extension(extension: dict, body: dict) -> bool:
+        body_first, body_second = _point(body, 1), _point(body, 2)
+        if (
+            abs(body_second[0] - body_first[0]) <= tolerance
+            or abs(body_second[1] - body_first[1]) <= tolerance
+        ):
+            return False
+        for contact, outer in (
+            (_point(extension, 1), _point(extension, 2)),
+            (_point(extension, 2), _point(extension, 1)),
+        ):
+            if (
+                not touches_pin_endpoint(outer)
+                or min(
+                    _distance(contact, body_first),
+                    _distance(contact, body_second),
+                )
+                <= tolerance
+                or _point_to_segment(
+                    contact,
+                    body_first,
+                    body_second,
+                )[0]
+                > tolerance
+            ):
+                continue
+            return True
+        return False
+
+    body_bboxes = [
+        _bbox_for_lines([line])
+        for _line_index, line in body_records
+    ]
+    for first_index, (_line_index, first) in enumerate(body_records):
+        for second_index in range(first_index + 1, len(body_records)):
+            if not _bboxes_touch(
+                body_bboxes[first_index],
+                body_bboxes[second_index],
+                tolerance,
+            ):
+                continue
+            second = body_records[second_index][1]
+            if is_pin_extension(first, second) or is_pin_extension(
+                second,
+                first,
+            ):
+                union(first_index, second_index)
+
     grouped: dict[int, list[tuple[int, dict]]] = {}
     for record_index, record in enumerate(body_records):
         grouped.setdefault(find(record_index), []).append(record)
@@ -862,6 +943,136 @@ def _recover_visible_pin_numbers(
     return recovered
 
 
+def _recover_spacer_pin(
+    page: dict,
+    component: dict,
+    wires: list[dict],
+    excluded_line_indexes: set[int],
+) -> set[int]:
+    """Recover an SP pin stub separated slightly from its drawn body."""
+    if (
+        component.get("pins")
+        or not str(component.get("reference") or "").startswith("SP")
+    ):
+        return set()
+
+    bbox = component["bbox"]
+    candidates = []
+    for index, candidate in enumerate(page["lines"]):
+        if (
+            index in excluded_line_indexes
+            or candidate.get("color") != PIN_COLOR
+            or not 0.2 <= pdf_dump._line_length(candidate) <= 8.0
+            or _bbox_distance(_bbox_for_lines([candidate]), bbox) > 1.5
+        ):
+            continue
+        for hot, other in (
+            (_point(candidate, 1), _point(candidate, 2)),
+            (_point(candidate, 2), _point(candidate, 1)),
+        ):
+            wire_hit = _point_on_any_wire(
+                hot,
+                wires,
+                max(GEOM_TOL, 0.08),
+            )
+            if not wire_hit:
+                continue
+            other_bbox = {
+                "x0": other[0],
+                "y0": other[1],
+                "x1": other[0],
+                "y1": other[1],
+            }
+            hot_bbox = {
+                "x0": hot[0],
+                "y0": hot[1],
+                "x1": hot[0],
+                "y1": hot[1],
+            }
+            other_distance = _bbox_distance(other_bbox, bbox)
+            hot_distance = _bbox_distance(hot_bbox, bbox)
+            if other_distance > 1.5 or other_distance >= hot_distance:
+                continue
+            candidates.append(
+                (
+                    wire_hit[0] + other_distance,
+                    index,
+                    wire_hit[1],
+                    other,
+                )
+            )
+    if not candidates:
+        return set()
+
+    _score, line_index, hot, other = min(candidates)
+    component["pins"] = [{
+        "hot": {"x": hot[0], "y": hot[1]},
+        "other": {"x": other[0], "y": other[1]},
+        "length": round(_distance(hot, other), 3),
+        "number": "1",
+        "line_index": line_index,
+    }]
+    return {line_index}
+
+
+def _recover_negated_pin_names(page: dict, component: dict) -> set[int]:
+    """Convert PDF overline strokes into KiCad negated pin-name markup."""
+    consumed_lines = set()
+    component_lines = component.setdefault("line_indexes", set())
+    for pin in component.get("pins", []):
+        name_text = pin.get("name_text")
+        name = str(pin.get("name") or "").strip()
+        if (
+            not name_text
+            or not name
+            or name.startswith("~{")
+            or int(round(name_text.get("angle", 0))) % 180 != 0
+        ):
+            continue
+        text_bbox = _text_bbox(name_text)
+        text_width = max(text_bbox["x1"] - text_bbox["x0"], 0.1)
+        candidates = []
+        for index, line in enumerate(page["lines"]):
+            if (
+                index in consumed_lines
+                or line.get("color") != PIN_NAME_COLOR
+                or abs(line["y1"] - line["y2"]) > GEOM_TOL
+            ):
+                continue
+            line_x0, line_x1 = sorted((line["x1"], line["x2"]))
+            overlap = max(
+                0.0,
+                min(line_x1, text_bbox["x1"])
+                - max(line_x0, text_bbox["x0"]),
+            )
+            line_y = (line["y1"] + line["y2"]) / 2
+            if (
+                overlap < text_width * 0.75
+                or not (
+                    text_bbox["y0"] - 0.3
+                    <= line_y
+                    <= text_bbox["y0"] + 0.1
+                )
+            ):
+                continue
+            candidates.append(
+                (
+                    abs(line_y - text_bbox["y0"])
+                    + abs(line_x0 - text_bbox["x0"])
+                    + abs(line_x1 - text_bbox["x1"]),
+                    index,
+                )
+            )
+        if not candidates:
+            continue
+        _score, index = min(candidates)
+        pin["name"] = f"~{{{name}}}"
+        pin["negated"] = True
+        component_lines.add(index)
+        consumed_lines.add(index)
+    return consumed_lines
+
+
 def _reference_matches_pin_count(reference: str, pin_count: int) -> bool:
     match = re.match(r"([A-Za-z]+)", reference or "")
     prefix = match.group(1).upper() if match else ""
@@ -963,7 +1174,14 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
         )
 
     body_lines = []
-    component_line_indexes = set(component.get("line_indexes", set()))
+    component_line_indexes = {
+        *component.get("line_indexes", set()),
+        *(
+            pin["line_index"]
+            for pin in component.get("pins", [])
+            if pin.get("line_index") is not None
+        ),
+    }
     reference_match = re.match(
         r"([A-Za-z]+)",
         component.get("reference", ""),
@@ -988,7 +1206,11 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
     if body_lines:
         bbox = _bbox_union(bbox, _bbox_for_lines(body_lines))
 
-    curve_indexes = []
+    curve_indexes = {
+        index
+        for pin in component.get("pins", [])
+        for index in pin.get("curve_indexes", [])
+    }
     body_curves = []
     remaining_curves = [
         (index, curve, _curve_bbox(curve))
@@ -1006,7 +1228,7 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
                 BODY_CURVE_JOIN_TOL,
             ):
                 continue
-            curve_indexes.append(index)
+            curve_indexes.add(index)
             body_curves.append(curve)
             bbox = _bbox_union(bbox, curve_bbox)
             remaining_curves.remove(candidate)
@@ -1052,7 +1274,7 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
     component["body_curves"] = body_curves
     component["line_indexes"] = component_line_indexes
     component["rectangle_indexes"] = set(rectangle_indexes)
-    component["curve_indexes"] = set(curve_indexes)
+    component["curve_indexes"] = curve_indexes
 
 
 def _recover_connector_pin_labels(
@@ -1126,6 +1348,100 @@ def _suppress_numeric_j_pin_names(component: dict) -> None:
         pin.pop("name", None)
 
 
+def _maximum_cardinality_pairs(
+    pair_scores: list[tuple[float, int, int]],
+) -> list[tuple[float, int, int]]:
+    """Return a minimum-cost matching among maximum-cardinality pairings."""
+    if not pair_scores:
+        return []
+
+    text_indexes = sorted({text for _score, _cluster, text in pair_scores})
+    cluster_indexes = sorted({
+        cluster for _score, cluster, _text in pair_scores
+    })
+    text_nodes = {
+        text_index: offset + 1
+        for offset, text_index in enumerate(text_indexes)
+    }
+    cluster_nodes = {
+        cluster_index: offset + 1 + len(text_indexes)
+        for offset, cluster_index in enumerate(cluster_indexes)
+    }
+    source = 0
+    sink = 1 + len(text_indexes) + len(cluster_indexes)
+    graph: list[list[list]] = [[] for _index in range(sink + 1)]
+
+    def add_edge(start: int, end: int, capacity: int, cost: float) -> list:
+        forward = [end, len(graph[end]), capacity, cost]
+        reverse = [start, len(graph[start]), 0, -cost]
+        graph[start].append(forward)
+        graph[end].append(reverse)
+        return forward
+
+    for text_index in text_indexes:
+        add_edge(source, text_nodes[text_index], 1, 0.0)
+    for cluster_index in cluster_indexes:
+        add_edge(cluster_nodes[cluster_index], sink, 1, 0.0)
+
+    candidate_edges = {}
+    scores = {}
+    for score, cluster_index, text_index in pair_scores:
+        scores[(cluster_index, text_index)] = score
+        candidate_edges[(cluster_index, text_index)] = add_edge(
+            text_nodes[text_index],
+            cluster_nodes[cluster_index],
+            1,
+            score,
+        )
+
+    # Successive shortest augmenting paths on the residual graph produce
+    # maximum cardinality first and minimum total score within that cardinality.
+    while True:
+        distance = [math.inf] * len(graph)
+        previous: list[tuple[int, int] | None] = [None] * len(graph)
+        in_queue = [False] * len(graph)
+        queue = [source]
+        distance[source] = 0.0
+        in_queue[source] = True
+        queue_index = 0
+        while queue_index < len(queue):
+            node = queue[queue_index]
+            queue_index += 1
+            in_queue[node] = False
+            for edge_index, edge in enumerate(graph[node]):
+                end, _reverse, capacity, cost = edge
+                if capacity <= 0:
+                    continue
+                candidate_distance = distance[node] + cost
+                if candidate_distance >= distance[end] - 1e-9:
+                    continue
+                distance[end] = candidate_distance
+                previous[end] = (node, edge_index)
+                if not in_queue[end]:
+                    queue.append(end)
+                    in_queue[end] = True
+        if previous[sink] is None:
+            break
+        node = sink
+        while node != source:
+            prior, edge_index = previous[node]
+            edge = graph[prior][edge_index]
+            reverse_index = edge[1]
+            edge[2] -= 1
+            graph[node][reverse_index][2] += 1
+            node = prior
+
+    return sorted(
+        (
+            scores[(cluster_index, text_index)],
+            cluster_index,
+            text_index,
+        )
+        for (cluster_index, text_index), edge in candidate_edges.items()
+        if edge[2] == 0
+    )
+
+
 def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
     _split_merged_reference_values(page)
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
@@ -1152,8 +1468,14 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
         if reference_text:
             used_texts.add(_text_key(reference_text))
         bbox = component["bbox"]
+        recovered_spacer_lines = _recover_spacer_pin(
+            page,
+            component,
+            wires,
+            used_line_indexes,
+        )
         body_lines = []
-        component_line_indexes = set()
+        component_line_indexes = set(recovered_spacer_lines)
         for index, line in enumerate(page["lines"]):
             if line.get("color") == BODY_COLOR and (
                 _point_in_bbox(_point(line, 1), bbox, GEOM_TOL)
@@ -1169,6 +1491,7 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
         component["body_lines"] = body_lines
         component["line_indexes"] = component_line_indexes
         _augment_component_geometry(page, component)
+        _recover_negated_pin_names(page, component)
         used_texts.update(
             _recover_visible_pin_numbers(page, component, used_texts)
         )
@@ -1212,12 +1535,39 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
                 continue
             distance = _bbox_distance(cluster["bbox"], _text_bbox(text))
             if distance <= 6.0:
-                pair_scores.append((distance, cluster_index, text_index))
+                text_bbox = _text_bbox(text)
+                text_center = (
+                    (text_bbox["x0"] + text_bbox["x1"]) / 2,
+                    (text_bbox["y0"] + text_bbox["y1"]) / 2,
+                )
+                cluster_center = (
+                    (cluster["bbox"]["x0"] + cluster["bbox"]["x1"]) / 2,
+                    (cluster["bbox"]["y0"] + cluster["bbox"]["y1"]) / 2,
+                )
+                angle = int(round(text.get("angle", 0))) % 180
+                cross_offset = (
+                    cluster_center[1] - text_center[1]
+                    if angle == 0
+                    else cluster_center[0] - text_center[0]
+                )
+                # Rotated reference text commonly protrudes about 0.7 mm
+                # beyond its own body.  Treat that small negative offset as
+                # alignment noise while still rejecting the previous body in
+                # a dense bank several millimetres away.
+                score = (
+                    distance
+                    + max(
+                        0.0,
+                        -cross_offset - REFERENCE_DIRECTION_TOL,
+                    )
+                    * 5.0
+                )
+                pair_scores.append((score, cluster_index, text_index))
     paired_clusters = set()
     paired_texts = set()
-    for _score, cluster_index, text_index in sorted(pair_scores):
-        if cluster_index in paired_clusters or text_index in paired_texts:
-            continue
+    for _score, cluster_index, text_index in _maximum_cardinality_pairs(
+        pair_scores
+    ):
         cluster = clusters[cluster_index]
         text = reference_texts[text_index]
         pins = _pins_from_cluster(cluster)
@@ -1233,6 +1583,7 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
             "curve_indexes": set(cluster.get("curve_indexes", set())),
         }
         _augment_component_geometry(page, component)
+        _recover_negated_pin_names(page, component)
         used_texts.update(
             _recover_visible_pin_numbers(page, component, used_texts)
         )
@@ -1297,6 +1648,11 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
     if wires:
         for text in reference_texts:
             if _text_key(text) in used_texts:
+                continue
+            if any(
+                component.get("reference") == text.get("text", "").strip()
+                for component in known
+            ):
                 continue
             bbox = _text_bbox(text)
             pins = []
@@ -1393,14 +1749,10 @@ def assign_values(
                 not value
                 or text.get("color") != "#000000"
                 or REF_RE.match(value)
-                or (
-                    reference_prefix in ("R", "C")
-                    and value[0] not in "0123456789."
-                )
-                or int(round(text.get("angle", 0))) % 180
-                != reference_angle
             ):
                 continue
+            value_angle = int(round(text.get("angle", 0))) % 180
+            same_angle = value_angle == reference_angle
             if (
                 _looks_like_passive_value(value)
                 and reference_prefix not in ("R", "C", "L", "FB")
@@ -1434,9 +1786,15 @@ def assign_values(
                 cross_distance = abs(dx)
                 cross_offset = dx
                 along_distance = abs(dy)
+            passive_prefix = reference_prefix in ("R", "C", "L", "FB")
             if (
-                bbox_distance <= 6.0
-                and cross_distance <= max(2.0, size * 1.8)
+                same_angle
+                and bbox_distance <= 6.0
+                and cross_distance <= (
+                    max(4.5, size * 4.0)
+                    if passive_prefix
+                    else max(2.0, size * 1.8)
+                )
             ):
                 # Capture centers or aligns reference/value text along the
                 # symbol axis.
@@ -1444,7 +1802,11 @@ def assign_values(
                     bbox_distance
                     + cross_distance * 4.0
                     + along_distance * 0.05
-                    + max(0.0, -cross_offset) * 5.0
+                    + max(
+                        0.0,
+                        -cross_offset - REFERENCE_DIRECTION_TOL,
+                    )
+                    * 5.0
                 )
                 if (
                     reference_prefix in ("R", "C", "L", "FB")
@@ -1474,9 +1836,40 @@ def assign_values(
                 )
 
             component_bbox = component.get("bbox")
+            if component_bbox and passive_prefix:
+                body_distance = _bbox_distance(component_bbox, text_bbox)
+                if body_distance <= 6.0:
+                    component_center = (
+                        (
+                            component_bbox["x0"]
+                            + component_bbox["x1"]
+                        ) / 2,
+                        (
+                            component_bbox["y0"]
+                            + component_bbox["y1"]
+                        ) / 2,
+                    )
+                    body_pair_scores.append(
+                        (
+                            body_distance
+                            + _distance(text_center, component_center) * 0.2
+                            + (0.0 if same_angle else 0.5),
+                            component_index,
+                            text_index,
+                            key,
+                        )
+                    )
             if (
                 component_bbox
-                and reference_prefix in ("U", "CN", "J", "FB", "FL", "SP")
+                and reference_prefix in (
+                    "U",
+                    "CN",
+                    "J",
+                    "JSW",
+                    "FB",
+                    "FL",
+                    "SP",
+                )
                 and not (
                     reference_prefix == "U"
                     and (
@@ -1529,11 +1922,14 @@ def assign_values(
 
     paired_components = set()
     paired_texts = set()
-    for _score, component_index, text_index, key in sorted(
-        aligned_pair_scores
+    for _score, component_index, text_index in _maximum_cardinality_pairs(
+        [
+            (score, component_index, text_index)
+            for score, component_index, text_index, _key
+            in aligned_pair_scores
+        ]
     ):
-        if component_index in paired_components or key in paired_texts:
-            continue
+        key = _text_key(page["texts"][text_index])
         value_text = page["texts"][text_index]
         component = components[component_index]
         component["value"] = value_text["text"]
@@ -1542,11 +1938,17 @@ def assign_values(
         paired_components.add(component_index)
         paired_texts.add(key)
 
-    for _score, component_index, text_index, key in sorted(
-        body_pair_scores
+    for _score, component_index, text_index in _maximum_cardinality_pairs(
+        [
+            (score, component_index, text_index)
+            for score, component_index, text_index, key in body_pair_scores
+            if (
+                component_index not in paired_components
+                and key not in paired_texts
+            )
+        ]
     ):
-        if component_index in paired_components or key in paired_texts:
-            continue
+        key = _text_key(page["texts"][text_index])
         value_text = page["texts"][text_index]
         component = components[component_index]
         component["value"] = value_text["text"]
@@ -2650,6 +3052,17 @@ def _has_symmetric_two_pin_geometry(component: dict) -> bool:
     return hot_cross <= 0.05 * lengths[0] * max(hot_separation, 0.01)
 
 
+def _symbol_local_point(
+    transform: CoordinateTransform,
+    origin: tuple[float, float],
+    point: tuple[float, float],
+) -> tuple[float, float]:
+    """Return a local point whose emitted absolute position stays exact."""
+    origin_x, origin_y = transform.xy(*origin)
+    point_x, point_y = transform.xy(*point)
+    return round(point_x - origin_x, 2), round(origin_y - point_y, 2)
+
+
 def _symbol_unit_definition(
     transform: CoordinateTransform,
     component: dict,
@@ -2665,10 +3078,7 @@ def _symbol_unit_definition(
     )
 
     def local(point):
-        return (
-            transform.delta(point[0] - origin[0]),
-            -transform.delta(point[1] - origin[1]),
-        )
+        return _symbol_local_point(transform, origin, point)
 
     body = []
     for line in component.get("body_lines", []):
@@ -2734,8 +3144,11 @@ def _symbol_unit_definition(
         length = max(0.01, transform.delta(pin.get("length", 0.0)))
         number = _esc(pin["number"])
         name = _esc(pin.get("name") or "~")
+        graphic_style = pin.get("graphic_style", "line")
+        if graphic_style not in ("line", "inverted"):
+            graphic_style = "line"
         pin_parts.append(
-            "\t\t\t\t(pin passive line\n"
+            f"\t\t\t\t(pin passive {graphic_style}\n"
             f"\t\t\t\t\t(at {x:.2f} {y:.2f} {_pin_direction(pin)})\n"
             f"\t\t\t\t\t(length {length:.2f})\n"
             f'\t\t\t\t\t(name "{name}" '
