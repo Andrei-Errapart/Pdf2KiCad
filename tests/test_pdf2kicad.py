@@ -148,6 +148,197 @@ class PinLengthTests(unittest.TestCase):
         self.assertEqual(bridges, [])
 
 
+class ComponentEnrichmentTests(unittest.TestCase):
+    @staticmethod
+    def passive(reference, value):
+        return {
+            "reference": reference,
+            "value": value,
+            "bbox": {
+                "x0": 10.0,
+                "y0": 10.0,
+                "x1": 15.0,
+                "y1": 15.0,
+            },
+            "body_lines": [
+                line(pdf2kicad.BODY_COLOR, 10.0, 10.0, 15.0, 15.0)
+            ],
+            "pins": [
+                {
+                    "number": "1",
+                    "hot": {"x": 8.0, "y": 12.5},
+                    "other": {"x": 10.0, "y": 12.5},
+                    "length": 2.0,
+                },
+                {
+                    "number": "2",
+                    "hot": {"x": 17.0, "y": 12.5},
+                    "other": {"x": 15.0, "y": 12.5},
+                    "length": 2.0,
+                },
+            ],
+        }
+
+    @staticmethod
+    def enrich(part, *, footprints=False, rcl=False):
+        pdf2kicad._enrich_component(
+            part,
+            pdf2kicad.coordinate_transform("A4"),
+            infer_footprints=footprints,
+            use_kicad_rcl=rcl,
+        )
+
+    def test_dnp_suffix_sets_native_component_options_and_cleans_value(self):
+        part = self.passive("C531", "22u/10V/1608 *DNP")
+        self.enrich(part)
+
+        rendered = pdf2kicad._component_instance(
+            pdf2kicad.UuidFactory(b"dnp"),
+            pdf2kicad.coordinate_transform("A4"),
+            part,
+            "pdf2kicad:C531",
+        )
+
+        self.assertEqual(part["value"], "22u/10V/1608")
+        self.assertTrue(part["dnp"])
+        self.assertIn("(in_bom no)", rendered)
+        self.assertIn("(dnp yes)", rendered)
+        self.assertIn('(property "Value" "22u/10V/1608"', rendered)
+        self.assertNotIn("*DNP", rendered)
+
+    def test_infers_two_terminal_passive_footprints_from_package_tokens(self):
+        fixtures = [
+            ("R1", "10K/0603", "Resistor_SMD:R_0603_1608Metric"),
+            ("C1", "0.1u/10V/1608 *DNP", "Capacitor_SMD:C_0603_1608Metric"),
+            ("L1", "10uH/2012", "Inductor_SMD:L_0805_2012Metric"),
+            ("FB1", "600R/1005", "Inductor_SMD:L_0402_1005Metric"),
+        ]
+
+        for reference, value, footprint in fixtures:
+            with self.subTest(reference=reference):
+                part = self.passive(reference, value)
+                self.enrich(part, footprints=True)
+                self.assertEqual(part["footprint"], footprint)
+
+    def test_footprint_inference_ignores_part_numbers_and_four_pin_filters(self):
+        part_number = self.passive("R1", "CRF0805-FZ-R001ELF")
+        self.enrich(part_number, footprints=True)
+        four_pin_filter = self.passive("FB2", "600R/0603")
+        four_pin_filter["pins"].extend(copy.deepcopy(four_pin_filter["pins"]))
+        self.enrich(four_pin_filter, footprints=True)
+
+        self.assertNotIn("footprint", part_number)
+        self.assertNotIn("footprint", four_pin_filter)
+
+    def test_inferred_footprint_is_emitted_on_library_and_instance(self):
+        part = self.passive("R1", "10K/0603")
+        self.enrich(part, footprints=True)
+        definition = pdf2kicad._symbol_definition(
+            pdf2kicad.UuidFactory(b"footprint-definition"),
+            pdf2kicad.coordinate_transform("A4"),
+            part,
+            "pdf2kicad:R1",
+        )
+        instance = pdf2kicad._component_instance(
+            pdf2kicad.UuidFactory(b"footprint-instance"),
+            pdf2kicad.coordinate_transform("A4"),
+            part,
+            "pdf2kicad:R1",
+        )
+
+        expected = '(property "Footprint" "Resistor_SMD:R_0603_1608Metric"'
+        self.assertIn(expected, definition)
+        self.assertIn(expected, instance)
+
+    def test_kicad_rcl_loads_standard_device_library_symbols(self):
+        fixtures = [
+            ("R1", "10K", "R", "Device:R"),
+            ("C1", "0.1u", "C", "Device:C"),
+            ("L1", "10uH", "L", "Device:L"),
+            ("FB1", "600R", "FB", "Device:FerriteBead"),
+        ]
+
+        for reference, value, kind, lib_id in fixtures:
+            with self.subTest(reference=reference):
+                part = self.passive(reference, value)
+                self.enrich(part, rcl=True)
+                definition = pdf2kicad._standard_passive_definition(kind)
+
+                self.assertEqual(part["standard_lib_id"], lib_id)
+                self.assertEqual(part["standard_angle"], 90)
+                self.assertIn(f'(symbol "{lib_id}"', definition)
+                self.assertIn("(at 0 3.81 270)", definition)
+                self.assertIn("(at 0 -3.81 90)", definition)
+
+    def test_kicad_rcl_shares_one_definition_per_device_symbol(self):
+        parts = [
+            self.passive("R1", "10K"),
+            self.passive("R2", "22K"),
+            self.passive("C1", "0.1u"),
+        ]
+        for part in parts:
+            self.enrich(part, rcl=True)
+        rendered = pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"shared-passives"),
+            {"lines": [], "rectangles": [], "curves": [], "texts": []},
+            {
+                "components": parts,
+                "wires": [],
+                "power_ports": [],
+                "global_labels": [],
+                "local_labels": [],
+                "consumed_texts": set(),
+                "semantic_lines": set(),
+                "semantic_rectangles": set(),
+                "semantic_curves": set(),
+                "worksheet": None,
+            },
+            pdf2kicad.coordinate_transform("A4"),
+            "Shared passives",
+            False,
+        )
+
+        self.assertEqual(rendered.count('(symbol "Device:R"\n'), 1)
+        self.assertEqual(rendered.count('(lib_id "Device:R")'), 2)
+        self.assertEqual(rendered.count('(symbol "Device:C"\n'), 1)
+        self.assertEqual(rendered.count('(lib_id "Device:C")'), 1)
+        self.assertNotIn('(symbol "pdf2kicad:R', rendered)
+
+    def test_kicad_rcl_bridges_stock_pins_to_recovered_hotpoints(self):
+        part = self.passive("R1", "10K")
+        self.enrich(part, rcl=True)
+
+        relocations, bridges = pdf2kicad._pin_relocations(
+            [part],
+            pdf2kicad.coordinate_transform("A4"),
+            {},
+        )
+
+        self.assertEqual(relocations[(8.0, 12.5)], (8.0, 12.5))
+        self.assertEqual(relocations[(17.0, 12.5)], (17.0, 12.5))
+        self.assertEqual(len(bridges), 2)
+        self.assertIn(
+            {"start": {"x": 8.0, "y": 12.5},
+             "end": {"x": 8.69, "y": 12.5}},
+            bridges,
+        )
+
+    def test_kicad_rcl_leaves_four_pin_inductors_unchanged(self):
+        part = self.passive("L2", "COMMON_MODE")
+        part["pins"].extend(copy.deepcopy(part["pins"]))
+        self.enrich(part, rcl=True)
+
+        self.assertNotIn("standard_passive", part)
+
+    def test_kicad_rcl_leaves_nonstandard_pin_numbers_unchanged(self):
+        part = self.passive("L3", "10uH")
+        part["pins"][0]["number"] = "3"
+        part["pins"][1]["number"] = "4"
+        self.enrich(part, rcl=True)
+
+        self.assertNotIn("standard_passive", part)
+
+
 class SheetNamingTests(unittest.TestCase):
     @staticmethod
     def page(number, *headings, components=None, wires=None):
