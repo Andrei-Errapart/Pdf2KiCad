@@ -135,12 +135,36 @@ STANDARD_PASSIVE_LIB_IDS = {
     "L": "Device:L",
     "FB": "Device:FerriteBead",
 }
+STANDARD_POWER_NAMES = (
+    "+10V", "+12C", "+12L", "+12LF", "+12P", "+12V", "+12VA",
+    "+15V", "+1V0", "+1V1", "+1V2", "+1V35", "+1V5", "+1V8",
+    "+24V", "+28V", "+2V5", "+2V8", "+3.3V", "+3.3VA", "+3.3VADC",
+    "+3.3VDAC", "+3.3VP", "+36V", "+3V0", "+3V3", "+3V8", "+48V",
+    "+4V", "+5C", "+5F", "+5P", "+5V", "+5VA", "+5VD", "+5VL",
+    "+5VP", "+6V", "+7.5V", "+8V", "+9V", "+9VA", "+BATT", "+VDC",
+    "+VSW", "-10V", "-12V", "-12VA", "-15V", "-24V", "-2V5", "-36V",
+    "-3V3", "-48V", "-5V", "-5VA", "-6V", "-8V", "-9V", "-9VA",
+    "-BATT", "-VDC", "-VSW", "AC", "Earth", "Earth_Clean",
+    "Earth_Protective", "GND", "GND1", "GND2", "GND3", "GNDA", "GNDD",
+    "GNDPWR", "GNDREF", "GNDS", "HT", "LINE", "NEUT", "PRI_HI",
+    "PRI_LO", "PRI_MID", "PWR_FLAG", "VAA", "VAC", "VBUS", "VCC",
+    "VCCQ", "VCOM", "VD", "VDC", "VDD", "VDDA", "VDDF", "VEE",
+    "VMEM", "VPP", "VS", "VSS", "VSSA", "Vdrive",
+)
+STANDARD_POWER_NAME_MAP = {
+    name.upper(): name for name in STANDARD_POWER_NAMES
+}
 STANDARD_PASSIVE_PIN_OFFSET = 3.81
 _KICAD_DEVICE_SYMBOLS: dict[str, str] | None = None
 
 
 def _esc(value) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _safe_library_symbol_name(value) -> str:
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", str(value))
+    return name or "Symbol"
 
 
 def _text_key(text: dict) -> tuple:
@@ -3103,9 +3127,17 @@ def _label(factory, transform, label) -> str:
     )
 
 
+def _power_lib_name(power: dict) -> str:
+    name = str(power.get("name") or "").strip().upper()
+    fallback = "GND" if power.get("glyph") == "ground" else "VCC"
+    return STANDARD_POWER_NAME_MAP.get(name, fallback)
+
+
 def _power_symbol_definition(power: dict) -> str:
-    name = _esc(power["name"])
-    ground = power["glyph"] == "ground"
+    name = _esc(_power_lib_name(power))
+    upper_name = name.upper()
+    ground = upper_name.startswith(("GND", "EARTH"))
+    negative = name.startswith("-") or upper_name in ("VEE", "VSS", "VSSA")
     if ground:
         reference_y = -6.35
         value_y = -3.81
@@ -3113,35 +3145,55 @@ def _power_symbol_definition(power: dict) -> str:
         body = (
             f'\t\t\t(symbol "{name}_0_1"\n'
             "\t\t\t\t(polyline\n"
-            "\t\t\t\t\t(pts (xy -2.54 0) (xy 2.54 0))\n"
+            "\t\t\t\t\t(pts (xy 0 0) (xy 0 -1.27) "
+            "(xy 1.27 -1.27) (xy 0 -2.54) "
+            "(xy -1.27 -1.27) (xy 0 -1.27))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t)\n"
+        )
+    elif negative:
+        reference_y = 3.81
+        value_y = -3.556
+        pin_angle = 270
+        body = (
+            f'\t\t\t(symbol "{name}_0_1"\n'
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy -0.762 -1.27) (xy 0 -2.54))\n"
             "\t\t\t\t\t(stroke (width 0) (type default))\n"
             "\t\t\t\t\t(fill (type none))\n"
             "\t\t\t\t)\n"
             "\t\t\t\t(polyline\n"
-            "\t\t\t\t\t(pts (xy 2.54 0) (xy 0 -2.54))\n"
+            "\t\t\t\t\t(pts (xy 0 -2.54) (xy 0.762 -1.27))\n"
             "\t\t\t\t\t(stroke (width 0) (type default))\n"
             "\t\t\t\t\t(fill (type none))\n"
             "\t\t\t\t)\n"
             "\t\t\t\t(polyline\n"
-            "\t\t\t\t\t(pts (xy 0 -2.54) (xy -2.54 0))\n"
+            "\t\t\t\t\t(pts (xy 0 0) (xy 0 -2.54))\n"
             "\t\t\t\t\t(stroke (width 0) (type default))\n"
             "\t\t\t\t\t(fill (type none))\n"
             "\t\t\t\t)\n"
             "\t\t\t)\n"
         )
     else:
-        reference_y = -2.54
-        value_y = 2.286
+        reference_y = -3.81
+        value_y = 3.556
         pin_angle = 90
         body = (
             f'\t\t\t(symbol "{name}_0_1"\n'
             "\t\t\t\t(polyline\n"
-            "\t\t\t\t\t(pts (xy 0 2.54) (xy 0 0))\n"
+            "\t\t\t\t\t(pts (xy -0.762 1.27) (xy 0 2.54))\n"
             "\t\t\t\t\t(stroke (width 0) (type default))\n"
             "\t\t\t\t\t(fill (type none))\n"
             "\t\t\t\t)\n"
             "\t\t\t\t(polyline\n"
-            "\t\t\t\t\t(pts (xy -1.27 2.54) (xy 1.27 2.54))\n"
+            "\t\t\t\t\t(pts (xy 0 2.54) (xy 0.762 1.27))\n"
+            "\t\t\t\t\t(stroke (width 0) (type default))\n"
+            "\t\t\t\t\t(fill (type none))\n"
+            "\t\t\t\t)\n"
+            "\t\t\t\t(polyline\n"
+            "\t\t\t\t\t(pts (xy 0 0) (xy 0 2.54))\n"
             "\t\t\t\t\t(stroke (width 0) (type default))\n"
             "\t\t\t\t\t(fill (type none))\n"
             "\t\t\t\t)\n"
@@ -3149,7 +3201,7 @@ def _power_symbol_definition(power: dict) -> str:
         )
     return (
         f'\t\t(symbol "power:{name}"\n'
-        "\t\t\t(power)\n"
+        "\t\t\t(power global)\n"
         "\t\t\t(pin_numbers hide)\n"
         "\t\t\t(pin_names (offset 0) hide)\n"
         "\t\t\t(exclude_from_sim no)\n"
@@ -3168,7 +3220,7 @@ def _power_symbol_definition(power: dict) -> str:
         "\t\t\t\t(pin power_in line\n"
         f"\t\t\t\t\t(at 0 0 {pin_angle})\n"
         "\t\t\t\t\t(length 0)\n"
-        f'\t\t\t\t\t(name "{name}" '
+        '\t\t\t\t\t(name "" '
         "(effects (font (size 1.27 1.27))))\n"
         '\t\t\t\t\t(number "1" '
         "(effects (font (size 1.27 1.27))))\n"
@@ -3188,6 +3240,7 @@ def _power_symbol_instance(
     x, y = transform.xy(*power["point"])
     angle = int(power.get("angle", 0)) % 360
     name = _esc(power["name"])
+    lib_name = _esc(_power_lib_name(power))
     reference = _esc(power.get("reference", "#PWR0001"))
     text = power.get("text")
     if text:
@@ -3203,7 +3256,7 @@ def _power_symbol_instance(
         value_hide = " (hide yes)"
     return (
         "\t(symbol\n"
-        f'\t\t(lib_id "power:{name}")\n'
+        f'\t\t(lib_id "power:{lib_name}")\n'
         f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
         "\t\t(unit 1)\n"
         "\t\t(exclude_from_sim no)\n"
@@ -3872,6 +3925,37 @@ def _graphic_text(factory, transform, text) -> str:
     )
 
 
+def _component_lib_ids(components: list[dict]) -> list[str]:
+    multi_unit_ids = {}
+    used_names = set()
+    lib_ids = []
+    for component in components:
+        standard_lib_id = component.get("standard_lib_id")
+        if standard_lib_id:
+            lib_ids.append(standard_lib_id)
+            continue
+
+        multi_unit = component.get("multi_unit")
+        if multi_unit in multi_unit_ids:
+            lib_ids.append(multi_unit_ids[multi_unit])
+            continue
+
+        safe_value = _safe_library_symbol_name(
+            component.get("value") or "Symbol"
+        )
+        safe_name = safe_value
+        suffix = 2
+        while safe_name in used_names:
+            safe_name = f"{safe_value}_{suffix}"
+            suffix += 1
+        used_names.add(safe_name)
+        lib_id = f"pdf2kicad:{safe_name}"
+        if multi_unit:
+            multi_unit_ids[multi_unit] = lib_id
+        lib_ids.append(lib_id)
+    return lib_ids
+
+
 def render_page(
     factory: UuidFactory,
     page: dict,
@@ -3899,27 +3983,15 @@ def render_page(
     ]
     emitted_power_definitions = set()
     for power in semantic["power_ports"]:
-        name = power["name"]
-        if name not in emitted_power_definitions:
+        lib_name = _power_lib_name(power)
+        if lib_name not in emitted_power_definitions:
             parts.append(_power_symbol_definition(power))
-            emitted_power_definitions.add(name)
-    lib_ids = []
-    occurrences = Counter()
+            emitted_power_definitions.add(lib_name)
+    lib_ids = _component_lib_ids(semantic["components"])
     emitted_definitions = set()
-    for component in semantic["components"]:
+    for component, lib_id in zip(semantic["components"], lib_ids):
         multi_unit = component.get("multi_unit")
         standard_lib_id = component.get("standard_lib_id")
-        if standard_lib_id:
-            lib_id = standard_lib_id
-        elif multi_unit:
-            safe_ref = re.sub(r"[^A-Za-z0-9_]+", "_", multi_unit)
-            lib_id = f"pdf2kicad:{safe_ref}_multi"
-        else:
-            occurrences[component["reference"]] += 1
-            suffix = occurrences[component["reference"]]
-            safe_ref = re.sub(r"[^A-Za-z0-9_]+", "_", component["reference"])
-            lib_id = f"pdf2kicad:{safe_ref}_{suffix}"
-        lib_ids.append(lib_id)
         if lib_id in emitted_definitions:
             continue
         if standard_lib_id:
