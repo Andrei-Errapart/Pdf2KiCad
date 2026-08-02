@@ -64,7 +64,7 @@ KICAD_OUTLINE_FONT_COMPENSATION = 1.4
 ORCAD_TEXT_FACE = "Arial"
 PIN_LENGTH = 2.54
 PIN_TEXT_SIZE = 1.27
-DNP_SUFFIX_RE = re.compile(r"\s+\*DNP\s*$", re.IGNORECASE)
+DNP_SUFFIX_RE = re.compile(r"\s*\*DNP\s*$", re.IGNORECASE)
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
@@ -123,12 +123,6 @@ PASSIVE_FOOTPRINT_FAMILIES = {
     "C": ("Capacitor_SMD", "C"),
     "L": ("Inductor_SMD", "L"),
     "FB": ("Inductor_SMD", "L"),
-}
-STANDARD_PASSIVE_BODY_HALF_LENGTH = {
-    "R": 2.54,
-    "C": 1.016,
-    "L": 2.54,
-    "FB": 2.54,
 }
 STANDARD_PASSIVE_LIB_IDS = {
     "R": "Device:R",
@@ -1920,22 +1914,14 @@ def _infer_passive_footprint(component: dict) -> None:
 
 def _can_standardize_passive(
     component: dict,
-    transform: CoordinateTransform,
 ) -> bool:
-    kind = _passive_kind(component)
-    axis = _two_terminal_axis(component)
-    if kind is None or axis is None:
+    if (
+        _passive_kind(component) is None
+        or _two_terminal_axis(component) is None
+    ):
         return False
     pins = component["pins"]
-    if {str(pin.get("number")) for pin in pins} != {"1", "2"}:
-        return False
-    coordinate = "x" if axis == "horizontal" else "y"
-    center_coordinate = sum(pin["hot"][coordinate] for pin in pins) / 2
-    hot_distances = [
-        abs(pin["hot"][coordinate] - center_coordinate) * transform.scale
-        for pin in pins
-    ]
-    return min(hot_distances) > STANDARD_PASSIVE_BODY_HALF_LENGTH[kind] + 0.1
+    return {str(pin.get("number")) for pin in pins} == {"1", "2"}
 
 
 def _configure_standard_passive(
@@ -2017,7 +2003,7 @@ def _enrich_component(
     _configure_standard_testpoint(component)
     if infer_footprints:
         _infer_passive_footprint(component)
-    if use_kicad_rcl and _can_standardize_passive(component, transform):
+    if use_kicad_rcl and _can_standardize_passive(component):
         _configure_standard_passive(component, transform)
 
 
@@ -3488,16 +3474,82 @@ def _relocated_point(
     return relocations.get(_pin_point_key(point), point)
 
 
+def _wire_key(
+    wire: dict,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    return tuple(sorted((
+        _pin_point_key((wire["start"]["x"], wire["start"]["y"])),
+        _pin_point_key((wire["end"]["x"], wire["end"]["y"])),
+    )))
+
+
+def _wire_endpoint_can_move(
+    wire: dict,
+    old_point: tuple[float, float],
+    new_point: tuple[float, float],
+) -> bool:
+    """Return whether moving an endpoint preserves the wire's direction."""
+    start = (wire["start"]["x"], wire["start"]["y"])
+    end = (wire["end"]["x"], wire["end"]["y"])
+    if _point_close(old_point, start):
+        other_point = end
+    elif _point_close(old_point, end):
+        other_point = start
+    else:
+        return False
+    wire_dx = other_point[0] - old_point[0]
+    wire_dy = other_point[1] - old_point[1]
+    wire_length = math.hypot(wire_dx, wire_dy)
+    if wire_length <= 0.001:
+        return False
+    move_dx = new_point[0] - old_point[0]
+    move_dy = new_point[1] - old_point[1]
+    cross_distance = abs(move_dx * wire_dy - move_dy * wire_dx) / wire_length
+    return cross_distance <= GEOM_TOL
+
+
+def _wire_keeps_point(
+    wire: dict,
+    old_point: tuple[float, float],
+    new_point: tuple[float, float],
+) -> bool:
+    start = (wire["start"]["x"], wire["start"]["y"])
+    end = (wire["end"]["x"], wire["end"]["y"])
+    distance, _nearest = _point_to_segment(old_point, start, end)
+    if distance > GEOM_TOL:
+        return False
+    if not (
+        _point_close(old_point, start)
+        or _point_close(old_point, end)
+    ):
+        return True
+    return not _wire_endpoint_can_move(wire, old_point, new_point)
+
+
+@dataclass
+class PinRelocation:
+    native_moves: dict[tuple[float, float], tuple[float, float]]
+    standard_moves: dict[tuple[float, float], tuple[float, float]]
+    object_moves: dict[tuple[float, float], tuple[float, float]]
+    bridges: list[dict]
+    suppressed_wires: set[
+        tuple[tuple[float, float], tuple[float, float]]
+    ]
+
+
 def _pin_relocations(
     components: list[dict],
     transform: CoordinateTransform,
     multi_unit_groups: dict[str, list[dict]],
-) -> tuple[
-    dict[tuple[float, float], tuple[float, float]],
-    list[dict],
-]:
-    """Return page hotpoint moves and bridges for elongated symbol pins."""
+    semantic: dict | None = None,
+) -> PinRelocation:
+    """Resolve native pin extension and stock Device pin relocation."""
+    semantic = semantic or {}
+    wires = semantic.get("wires", [])
     pin_points: dict[tuple[float, float], dict] = {}
+    standard_pin_points: dict[tuple[float, float], dict] = {}
+    standard_pin_pairs = set()
+    pin_owners = []
     for component in components:
         group_name = component.get("multi_unit")
         symbol_components = (
@@ -3511,34 +3563,75 @@ def _pin_relocations(
             else _minimum_pin_length(symbol_components)
         )
         component_transform = component.get("_transform", transform)
+        original_pin_keys = []
         for pin in component.get("pins", []):
             old_hot = (pin["hot"]["x"], pin["hot"]["y"])
+            old_key = _pin_point_key(old_hot)
+            original_pin_keys.append(old_key)
+            pin_owners.append((old_key, component.get("reference", "")))
             new_hot, _length = _pin_for_output(
                 component_transform,
                 component,
                 pin,
                 minimum_length,
             )
+            if component.get("standard_passive"):
+                if not _point_close(old_hot, new_hot, 0.001):
+                    record = standard_pin_points.setdefault(
+                        old_key,
+                        {"old": old_hot, "moves": []},
+                    )
+                    record["moves"].append({
+                        "reference": component.get("reference", ""),
+                        "new": new_hot,
+                    })
+                continue
             record = pin_points.setdefault(
-                _pin_point_key(old_hot),
+                old_key,
                 {"old": old_hot, "outputs": []},
             )
-            if component.get("standard_passive") and not any(
-                _point_close(old_hot, output, 0.001)
-                for output in record["outputs"]
-            ):
-                # Keep the recovered connection point stationary and bridge
-                # it to the stock Device pin when their spans differ.
-                record["outputs"].append(old_hot)
             if not any(
                 _point_close(new_hot, output, 0.001)
                 for output in record["outputs"]
             ):
                 record["outputs"].append(new_hot)
+        if component.get("standard_passive") and len(original_pin_keys) == 2:
+            standard_pin_pairs.add(tuple(sorted(original_pin_keys)))
 
-    relocations = {}
+    # A nonstandard symbol pin can share the recovered hotpoint of a stock
+    # Device pin. Keep that old point as the native symbol's anchor so its own
+    # pin-length adjustment gets a bridge instead of silently disconnecting.
+    for key, standard_record in standard_pin_points.items():
+        if key not in pin_points:
+            continue
+        old_hot = standard_record["old"]
+        if not any(
+            _point_close(old_hot, output, 0.001)
+            for output in pin_points[key]["outputs"]
+        ):
+            pin_points[key]["outputs"].append(old_hot)
+
+    native_moves = {}
     bridges = []
     seen_bridges = set()
+
+    def add_bridge(
+        old_point: tuple[float, float],
+        new_point: tuple[float, float],
+    ) -> None:
+        bridge_key = tuple(
+            sorted((_pin_point_key(old_point), _pin_point_key(new_point)))
+        )
+        if bridge_key in seen_bridges:
+            return
+        bridges.append(
+            {
+                "start": {"x": old_point[0], "y": old_point[1]},
+                "end": {"x": new_point[0], "y": new_point[1]},
+            }
+        )
+        seen_bridges.add(bridge_key)
+
     for key, record in pin_points.items():
         old_hot = record["old"]
         outputs = record["outputs"]
@@ -3553,37 +3646,100 @@ def _pin_relocations(
             None,
         )
         anchor = stationary or outputs[0]
-        relocations[key] = anchor
+        native_moves[key] = anchor
         for output in outputs:
             if _point_close(anchor, output, 0.001):
                 continue
-            bridge_key = tuple(
-                sorted((_pin_point_key(anchor), _pin_point_key(output)))
+            add_bridge(anchor, output)
+
+    suppressed_wires = {
+        _wire_key(wire)
+        for wire in wires
+        if _wire_key(wire) in standard_pin_pairs
+    }
+    regular_wires = [
+        wire for wire in wires if _wire_key(wire) not in suppressed_wires
+    ]
+    power_points = {
+        _pin_point_key(tuple(power["point"]))
+        for power in semantic.get("power_ports", [])
+    }
+    label_points = {
+        _pin_point_key(tuple(label["point"]))
+        for label in (
+            semantic.get("global_labels", [])
+            + semantic.get("local_labels", [])
+        )
+    }
+
+    standard_moves = {}
+    anchored_standard_points = set()
+    for key, record in standard_pin_points.items():
+        distinct_outputs = []
+        for move in record["moves"]:
+            if not any(
+                _point_close(move["new"], output, 0.001)
+                for output in distinct_outputs
+            ):
+                distinct_outputs.append(move["new"])
+        if len(distinct_outputs) == 1:
+            standard_moves[key] = distinct_outputs[0]
+        else:
+            anchored_standard_points.add(key)
+
+        old_hot = record["old"]
+        for move in record["moves"]:
+            new_hot = move["new"]
+            reference = move["reference"]
+            anchored = (
+                key in anchored_standard_points
+                or key in power_points
+                or key in label_points
+                or any(
+                    owner_key == key and owner != reference
+                    for owner_key, owner in pin_owners
+                )
+                or any(
+                    _wire_keeps_point(wire, old_hot, new_hot)
+                    for wire in regular_wires
+                )
             )
-            if bridge_key in seen_bridges:
-                continue
-            bridges.append(
-                {
-                    "start": {"x": anchor[0], "y": anchor[1]},
-                    "end": {"x": output[0], "y": output[1]},
-                }
-            )
-            seen_bridges.add(bridge_key)
-    return relocations, bridges
+            if anchored:
+                anchored_standard_points.add(key)
+                add_bridge(old_hot, new_hot)
+
+    object_moves = dict(native_moves)
+    for key, new_hot in standard_moves.items():
+        if key in anchored_standard_points:
+            object_moves.pop(key, None)
+        else:
+            object_moves[key] = new_hot
+
+    return PinRelocation(
+        native_moves=native_moves,
+        standard_moves=standard_moves,
+        object_moves=object_moves,
+        bridges=bridges,
+        suppressed_wires=suppressed_wires,
+    )
 
 
 def _wire_with_relocated_pins(
     wire: dict,
-    relocations: dict[tuple[float, float], tuple[float, float]],
+    relocation: PinRelocation,
 ) -> dict:
-    start = _relocated_point(
-        (wire["start"]["x"], wire["start"]["y"]),
-        relocations,
-    )
-    end = _relocated_point(
-        (wire["end"]["x"], wire["end"]["y"]),
-        relocations,
-    )
+    def relocated_endpoint(point: tuple[float, float]) -> tuple[float, float]:
+        standard_point = relocation.standard_moves.get(_pin_point_key(point))
+        if standard_point is not None and _wire_endpoint_can_move(
+            wire,
+            point,
+            standard_point,
+        ):
+            return standard_point
+        return _relocated_point(point, relocation.native_moves)
+
+    start = relocated_endpoint((wire["start"]["x"], wire["start"]["y"]))
+    end = relocated_endpoint((wire["end"]["x"], wire["end"]["y"]))
     return {
         **wire,
         "start": {"x": start[0], "y": start[1]},
@@ -4047,10 +4203,11 @@ def render_page(
     worksheet_fields = (
         (semantic.get("worksheet") or {}).get("fields") or {}
     )
-    pin_relocations, pin_bridges = _pin_relocations(
+    pin_relocation = _pin_relocations(
         semantic["components"],
         transform,
         multi_unit_groups,
+        semantic,
     )
     parts = [
         _header(factory, transform.paper, title, worksheet_fields),
@@ -4091,14 +4248,16 @@ def render_page(
     parts.append("\t)\n")
 
     for wire in semantic["wires"]:
+        if _wire_key(wire) in pin_relocation.suppressed_wires:
+            continue
         parts.append(
             _wire(
                 factory,
                 transform,
-                _wire_with_relocated_pins(wire, pin_relocations),
+                _wire_with_relocated_pins(wire, pin_relocation),
             )
         )
-    for bridge in pin_bridges:
+    for bridge in pin_relocation.bridges:
         parts.append(_wire(factory, transform, bridge))
     for bus in semantic.get("buses", []):
         parts.append(_bus(factory, transform, bus))
@@ -4109,7 +4268,7 @@ def render_page(
             _junction(
                 factory,
                 transform,
-                _relocated_point(junction, pin_relocations),
+                _relocated_point(junction, pin_relocation.object_moves),
             )
         )
     for point in semantic.get("no_connects", []):
@@ -4117,7 +4276,7 @@ def render_page(
             _no_connect(
                 factory,
                 transform,
-                _relocated_point(point, pin_relocations),
+                _relocated_point(point, pin_relocation.object_moves),
             )
         )
     for component, lib_id in zip(semantic["components"], lib_ids):
@@ -4134,7 +4293,10 @@ def render_page(
     for power in semantic["power_ports"]:
         relocated_power = {
             **power,
-            "point": _relocated_point(power["point"], pin_relocations),
+            "point": _relocated_point(
+                power["point"],
+                pin_relocation.object_moves,
+            ),
         }
         parts.append(
             _power_symbol_instance(
@@ -4148,7 +4310,10 @@ def render_page(
     for label in semantic["global_labels"] + semantic["local_labels"]:
         relocated_label = {
             **label,
-            "point": _relocated_point(label["point"], pin_relocations),
+            "point": _relocated_point(
+                label["point"],
+                pin_relocation.object_moves,
+            ),
         }
         parts.append(_label(factory, transform, relocated_label))
 

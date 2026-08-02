@@ -128,7 +128,7 @@ class PinLengthTests(unittest.TestCase):
 
     def test_wire_endpoints_follow_elongated_pin_hotpoints(self):
         part = self.named_two_pin_component()
-        relocations, bridges = pdf2kicad._pin_relocations(
+        relocation = pdf2kicad._pin_relocations(
             [part],
             pdf2kicad.coordinate_transform("A4"),
             {},
@@ -140,12 +140,12 @@ class PinLengthTests(unittest.TestCase):
 
         relocated = pdf2kicad._wire_with_relocated_pins(
             wire,
-            relocations,
+            relocation,
         )
 
         self.assertEqual(relocated["start"], {"x": 4.92, "y": 11.5})
         self.assertEqual(relocated["end"], wire["end"])
-        self.assertEqual(bridges, [])
+        self.assertEqual(relocation.bridges, [])
 
 
 class ComponentEnrichmentTests(unittest.TestCase):
@@ -189,22 +189,24 @@ class ComponentEnrichmentTests(unittest.TestCase):
         )
 
     def test_dnp_suffix_sets_native_component_options_and_cleans_value(self):
-        part = self.passive("C531", "22u/10V/1608 *DNP")
-        self.enrich(part)
+        for suffix in ("*DNP", " *DNP", "\t*DNP"):
+            with self.subTest(suffix=repr(suffix)):
+                part = self.passive("C531", f"22u/10V/1608{suffix}")
+                self.enrich(part)
 
-        rendered = pdf2kicad._component_instance(
-            pdf2kicad.UuidFactory(b"dnp"),
-            pdf2kicad.coordinate_transform("A4"),
-            part,
-            "pdf2kicad:C531",
-        )
+                rendered = pdf2kicad._component_instance(
+                    pdf2kicad.UuidFactory(b"dnp"),
+                    pdf2kicad.coordinate_transform("A4"),
+                    part,
+                    "pdf2kicad:C531",
+                )
 
-        self.assertEqual(part["value"], "22u/10V/1608")
-        self.assertTrue(part["dnp"])
-        self.assertIn("(in_bom no)", rendered)
-        self.assertIn("(dnp yes)", rendered)
-        self.assertIn('(property "Value" "22u/10V/1608"', rendered)
-        self.assertNotIn("*DNP", rendered)
+                self.assertEqual(part["value"], "22u/10V/1608")
+                self.assertTrue(part["dnp"])
+                self.assertIn("(in_bom no)", rendered)
+                self.assertIn("(dnp yes)", rendered)
+                self.assertIn('(property "Value" "22u/10V/1608"', rendered)
+                self.assertNotIn("*DNP", rendered)
 
     def test_infers_two_terminal_passive_footprints_from_package_tokens(self):
         fixtures = [
@@ -304,23 +306,133 @@ class ComponentEnrichmentTests(unittest.TestCase):
         self.assertEqual(rendered.count('(lib_id "Device:C")'), 1)
         self.assertNotIn('(symbol "pdf2kicad:R', rendered)
 
-    def test_kicad_rcl_bridges_stock_pins_to_recovered_hotpoints(self):
+    def test_kicad_rcl_moves_collinear_wires_to_stock_hotpoints(self):
         part = self.passive("R1", "10K")
         self.enrich(part, rcl=True)
-
-        relocations, bridges = pdf2kicad._pin_relocations(
+        wires = [
+            {
+                "start": {"x": 8.0, "y": 12.5},
+                "end": {"x": 3.0, "y": 12.5},
+            },
+            {
+                "start": {"x": 17.0, "y": 12.5},
+                "end": {"x": 22.0, "y": 12.5},
+            },
+        ]
+        relocation = pdf2kicad._pin_relocations(
             [part],
             pdf2kicad.coordinate_transform("A4"),
             {},
+            {"wires": wires},
         )
 
-        self.assertEqual(relocations[(8.0, 12.5)], (8.0, 12.5))
-        self.assertEqual(relocations[(17.0, 12.5)], (17.0, 12.5))
-        self.assertEqual(len(bridges), 2)
+        relocated = [
+            pdf2kicad._wire_with_relocated_pins(wire, relocation)
+            for wire in wires
+        ]
+        self.assertEqual(relocated[0]["start"], {"x": 8.69, "y": 12.5})
+        self.assertEqual(relocated[1]["start"], {"x": 16.31, "y": 12.5})
+        self.assertEqual(relocation.bridges, [])
+
+    def test_kicad_rcl_bridges_a_wire_that_cannot_follow_its_pin(self):
+        part = self.passive("R1", "10K")
+        self.enrich(part, rcl=True)
+        wire = {
+            "start": {"x": 8.0, "y": 12.5},
+            "end": {"x": 8.0, "y": 5.0},
+        }
+
+        relocation = pdf2kicad._pin_relocations(
+            [part],
+            pdf2kicad.coordinate_transform("A4"),
+            {},
+            {"wires": [wire]},
+        )
+
+        self.assertEqual(
+            pdf2kicad._wire_with_relocated_pins(wire, relocation),
+            wire,
+        )
+        self.assertEqual(
+            relocation.bridges,
+            [{
+                "start": {"x": 8.0, "y": 12.5},
+                "end": {"x": 8.69, "y": 12.5},
+            }],
+        )
+
+    def test_kicad_rcl_bridges_when_a_label_anchors_the_old_hotpoint(self):
+        part = self.passive("R1", "10K")
+        self.enrich(part, rcl=True)
+        wire = {
+            "start": {"x": 8.0, "y": 12.5},
+            "end": {"x": 3.0, "y": 12.5},
+        }
+
+        relocation = pdf2kicad._pin_relocations(
+            [part],
+            pdf2kicad.coordinate_transform("A4"),
+            {},
+            {
+                "wires": [wire],
+                "local_labels": [{"point": (8.0, 12.5)}],
+            },
+        )
+
+        relocated = pdf2kicad._wire_with_relocated_pins(wire, relocation)
+        self.assertEqual(relocated["start"], {"x": 8.69, "y": 12.5})
+        self.assertEqual(
+            relocation.bridges,
+            [{
+                "start": {"x": 8.0, "y": 12.5},
+                "end": {"x": 8.69, "y": 12.5},
+            }],
+        )
+        self.assertEqual(
+            pdf2kicad._relocated_point(
+                (8.0, 12.5),
+                relocation.object_moves,
+            ),
+            (8.0, 12.5),
+        )
+
+    def test_kicad_rcl_accepts_hotpoints_inside_the_stock_body_span(self):
+        part = self.passive("R1", "10K")
+        part["pins"][0].update({
+            "hot": {"x": 11.5, "y": 12.5},
+            "other": {"x": 12.0, "y": 12.5},
+            "length": 0.5,
+        })
+        part["pins"][1].update({
+            "hot": {"x": 13.5, "y": 12.5},
+            "other": {"x": 13.0, "y": 12.5},
+            "length": 0.5,
+        })
+
+        self.enrich(part, rcl=True)
+
+        self.assertEqual(part["standard_passive"], "R")
+        self.assertEqual(part["standard_hotpoints"]["1"], (8.69, 12.5))
+        self.assertEqual(part["standard_hotpoints"]["2"], (16.31, 12.5))
+
+    def test_kicad_rcl_suppresses_original_pin_to_pin_wire(self):
+        part = self.passive("R1", "10K")
+        self.enrich(part, rcl=True)
+        wire = {
+            "start": {"x": 8.0, "y": 12.5},
+            "end": {"x": 17.0, "y": 12.5},
+        }
+
+        relocation = pdf2kicad._pin_relocations(
+            [part],
+            pdf2kicad.coordinate_transform("A4"),
+            {},
+            {"wires": [wire]},
+        )
+
         self.assertIn(
-            {"start": {"x": 8.0, "y": 12.5},
-             "end": {"x": 8.69, "y": 12.5}},
-            bridges,
+            pdf2kicad._wire_key(wire),
+            relocation.suppressed_wires,
         )
 
     def test_kicad_rcl_leaves_four_pin_inductors_unchanged(self):
