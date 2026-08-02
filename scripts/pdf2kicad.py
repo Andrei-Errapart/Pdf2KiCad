@@ -60,6 +60,8 @@ NO_CONNECT_COLOR = "#803f00"
 # so divide the PDF em size before emitting a KiCad `(size ...)`.
 KICAD_OUTLINE_FONT_COMPENSATION = 1.4
 ORCAD_TEXT_FACE = "Arial"
+PIN_LENGTH = 2.54
+PIN_TEXT_SIZE = 1.27
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
@@ -3010,6 +3012,173 @@ def _pin_direction(pin: dict) -> int:
     return 90 if dy > 0 else 270
 
 
+def _pin_numbers_hidden(components: list[dict]) -> bool:
+    return all(
+        len(component.get("pins", [])) == 1
+        or _has_symmetric_two_pin_geometry(component)
+        for component in components
+    )
+
+
+def _minimum_pin_length(components: list[dict]) -> float:
+    """Return the pin length needed by the longest visible pin number."""
+    longest_number = max(
+        (
+            len(str(pin.get("number") or ""))
+            for component in components
+            for pin in component.get("pins", [])
+        ),
+        default=0,
+    )
+    return max(PIN_LENGTH, (longest_number + 1) * PIN_TEXT_SIZE)
+
+
+def _pin_for_output(
+    transform: CoordinateTransform,
+    component: dict,
+    pin: dict,
+    minimum_length: float | None,
+) -> tuple[tuple[float, float], float]:
+    """Return the PDF-space hotpoint and KiCad length for an emitted pin."""
+    hot = (pin["hot"]["x"], pin["hot"]["y"])
+    other = (pin["other"]["x"], pin["other"]["y"])
+    current_length = max(
+        0.01,
+        transform.delta(pin.get("length", _distance(hot, other))),
+    )
+    if minimum_length is None or current_length >= minimum_length - 0.01:
+        return hot, current_length
+
+    dx, dy = other[0] - hot[0], other[1] - hot[1]
+    distance = math.hypot(dx, dy)
+    if distance > 0.01:
+        inward_x, inward_y = dx / distance, dy / distance
+    else:
+        bbox = component["bbox"]
+        center_x = (bbox["x0"] + bbox["x1"]) / 2
+        center_y = (bbox["y0"] + bbox["y1"]) / 2
+        center_dx, center_dy = hot[0] - center_x, hot[1] - center_y
+        if abs(center_dx) >= abs(center_dy):
+            inward_x = 1.0 if center_dx <= 0 else -1.0
+            inward_y = 0.0
+        else:
+            inward_x = 0.0
+            inward_y = 1.0 if center_dy <= 0 else -1.0
+
+    source_length = minimum_length / transform.scale
+    return (
+        other[0] - inward_x * source_length,
+        other[1] - inward_y * source_length,
+    ), minimum_length
+
+
+def _pin_point_key(point: tuple[float, float]) -> tuple[float, float]:
+    return round(point[0], 3), round(point[1], 3)
+
+
+def _relocated_point(
+    point: tuple[float, float],
+    relocations: dict[tuple[float, float], tuple[float, float]],
+) -> tuple[float, float]:
+    return relocations.get(_pin_point_key(point), point)
+
+
+def _pin_relocations(
+    components: list[dict],
+    transform: CoordinateTransform,
+    multi_unit_groups: dict[str, list[dict]],
+) -> tuple[
+    dict[tuple[float, float], tuple[float, float]],
+    list[dict],
+]:
+    """Return page hotpoint moves and bridges for elongated symbol pins."""
+    pin_points: dict[tuple[float, float], dict] = {}
+    for component in components:
+        group_name = component.get("multi_unit")
+        symbol_components = (
+            multi_unit_groups[group_name]
+            if group_name in multi_unit_groups
+            else [component]
+        )
+        minimum_length = (
+            None
+            if _pin_numbers_hidden(symbol_components)
+            else _minimum_pin_length(symbol_components)
+        )
+        component_transform = component.get("_transform", transform)
+        for pin in component.get("pins", []):
+            old_hot = (pin["hot"]["x"], pin["hot"]["y"])
+            new_hot, _length = _pin_for_output(
+                component_transform,
+                component,
+                pin,
+                minimum_length,
+            )
+            record = pin_points.setdefault(
+                _pin_point_key(old_hot),
+                {"old": old_hot, "outputs": []},
+            )
+            if not any(
+                _point_close(new_hot, output, 0.001)
+                for output in record["outputs"]
+            ):
+                record["outputs"].append(new_hot)
+
+    relocations = {}
+    bridges = []
+    seen_bridges = set()
+    for key, record in pin_points.items():
+        old_hot = record["old"]
+        outputs = record["outputs"]
+        if all(_point_close(old_hot, output, 0.001) for output in outputs):
+            continue
+        stationary = next(
+            (
+                output
+                for output in outputs
+                if _point_close(old_hot, output, 0.001)
+            ),
+            None,
+        )
+        anchor = stationary or outputs[0]
+        relocations[key] = anchor
+        for output in outputs:
+            if _point_close(anchor, output, 0.001):
+                continue
+            bridge_key = tuple(
+                sorted((_pin_point_key(anchor), _pin_point_key(output)))
+            )
+            if bridge_key in seen_bridges:
+                continue
+            bridges.append(
+                {
+                    "start": {"x": anchor[0], "y": anchor[1]},
+                    "end": {"x": output[0], "y": output[1]},
+                }
+            )
+            seen_bridges.add(bridge_key)
+    return relocations, bridges
+
+
+def _wire_with_relocated_pins(
+    wire: dict,
+    relocations: dict[tuple[float, float], tuple[float, float]],
+) -> dict:
+    start = _relocated_point(
+        (wire["start"]["x"], wire["start"]["y"]),
+        relocations,
+    )
+    end = _relocated_point(
+        (wire["end"]["x"], wire["end"]["y"]),
+        relocations,
+    )
+    return {
+        **wire,
+        "start": {"x": start[0], "y": start[1]},
+        "end": {"x": end[0], "y": end[1]},
+    }
+
+
 def _has_symmetric_two_pin_geometry(component: dict) -> bool:
     pins = component.get("pins", [])
     if len(pins) != 2 or any(
@@ -3070,6 +3239,7 @@ def _symbol_unit_definition(
     unit: int,
     *,
     multi_unit: bool,
+    minimum_pin_length: float | None,
 ) -> str:
     bbox = component["bbox"]
     origin = (
@@ -3139,9 +3309,13 @@ def _symbol_unit_definition(
 
     pin_parts = []
     for pin in component["pins"]:
-        hot = (pin["hot"]["x"], pin["hot"]["y"])
+        hot, length = _pin_for_output(
+            transform,
+            component,
+            pin,
+            minimum_pin_length,
+        )
         x, y = local(hot)
-        length = max(0.01, transform.delta(pin.get("length", 0.0)))
         number = _esc(pin["number"])
         name = _esc(pin.get("name") or "~")
         graphic_style = pin.get("graphic_style", "line")
@@ -3179,21 +3353,20 @@ def _symbol_definition(
     base = lib_id.split(":", 1)[-1]
     if units is None:
         units = [(1, transform, component)]
-    unit_components = [unit_component for _unit, _transform, unit_component in units]
+    unit_components = [
+        unit_component
+        for _unit, _transform, unit_component in units
+    ]
+    hide_pin_numbers = _pin_numbers_hidden(unit_components)
+    minimum_pin_length = (
+        None if hide_pin_numbers else _minimum_pin_length(unit_components)
+    )
     hide_names = "\t\t\t(pin_names (offset 1.016) hide)\n" if not any(
         pin.get("name")
         for unit_component in unit_components
         for pin in unit_component["pins"]
     ) else "\t\t\t(pin_names (offset 1.016))\n"
-    hide_numbers = (
-        "\t\t\t(pin_numbers hide)\n"
-        if all(
-            len(unit_component["pins"]) == 1
-            or _has_symmetric_two_pin_geometry(unit_component)
-            for unit_component in unit_components
-        )
-        else ""
-    )
+    hide_numbers = "\t\t\t(pin_numbers hide)\n" if hide_pin_numbers else ""
     return (
         f'\t\t(symbol "{lib_id}"\n'
         "\t\t\t(exclude_from_sim no)\n"
@@ -3216,6 +3389,7 @@ def _symbol_definition(
                 base,
                 unit,
                 multi_unit=len(units) > 1,
+                minimum_pin_length=minimum_pin_length,
             )
             for unit, unit_transform, unit_component in units
         )
@@ -3426,6 +3600,11 @@ def render_page(
     worksheet_fields = (
         (semantic.get("worksheet") or {}).get("fields") or {}
     )
+    pin_relocations, pin_bridges = _pin_relocations(
+        semantic["components"],
+        transform,
+        multi_unit_groups,
+    )
     parts = [
         _header(factory, transform.paper, title, worksheet_fields),
         "\t(lib_symbols\n",
@@ -3472,15 +3651,35 @@ def render_page(
     parts.append("\t)\n")
 
     for wire in semantic["wires"]:
-        parts.append(_wire(factory, transform, wire))
+        parts.append(
+            _wire(
+                factory,
+                transform,
+                _wire_with_relocated_pins(wire, pin_relocations),
+            )
+        )
+    for bridge in pin_bridges:
+        parts.append(_wire(factory, transform, bridge))
     for bus in semantic.get("buses", []):
         parts.append(_bus(factory, transform, bus))
     for entry in semantic.get("bus_entries", []):
         parts.append(_bus_entry(factory, transform, entry))
     for junction in semantic.get("junctions", []):
-        parts.append(_junction(factory, transform, junction))
+        parts.append(
+            _junction(
+                factory,
+                transform,
+                _relocated_point(junction, pin_relocations),
+            )
+        )
     for point in semantic.get("no_connects", []):
-        parts.append(_no_connect(factory, transform, point))
+        parts.append(
+            _no_connect(
+                factory,
+                transform,
+                _relocated_point(point, pin_relocations),
+            )
+        )
     for component, lib_id in zip(semantic["components"], lib_ids):
         parts.append(
             _component_instance(
@@ -3493,17 +3692,25 @@ def render_page(
             )
         )
     for power in semantic["power_ports"]:
+        relocated_power = {
+            **power,
+            "point": _relocated_point(power["point"], pin_relocations),
+        }
         parts.append(
             _power_symbol_instance(
                 factory,
                 transform,
-                power,
+                relocated_power,
                 project_name,
                 instance_path,
             )
         )
     for label in semantic["global_labels"] + semantic["local_labels"]:
-        parts.append(_label(factory, transform, label))
+        relocated_label = {
+            **label,
+            "point": _relocated_point(label["point"], pin_relocations),
+        }
+        parts.append(_label(factory, transform, relocated_label))
 
     if keep_graphics:
         for index, line in enumerate(page["lines"]):
