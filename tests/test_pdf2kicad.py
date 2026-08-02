@@ -2312,6 +2312,68 @@ class MultiUnitTests(unittest.TestCase):
         self.assertIn("\t\t(unit 2)\n", placement_b)
 
 
+class CustomSymbolNamingTests(unittest.TestCase):
+    @staticmethod
+    def render(*parts):
+        return pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"value-based-symbol-names"),
+            {"lines": [], "rectangles": [], "curves": [], "texts": []},
+            {
+                "components": list(parts),
+                "wires": [],
+                "power_ports": [],
+                "global_labels": [],
+                "local_labels": [],
+                "consumed_texts": set(),
+                "semantic_lines": set(),
+                "semantic_rectangles": set(),
+                "semantic_curves": set(),
+                "worksheet": None,
+            },
+            pdf2kicad.coordinate_transform("A4"),
+            "Value-based symbol names",
+            False,
+        )
+
+    def test_custom_library_entry_uses_component_value(self):
+        part = component("U48")
+        part["value"] = "FT230XS"
+
+        rendered = self.render(part)
+
+        self.assertIn('(symbol "pdf2kicad:FT230XS"', rendered)
+        self.assertIn('(lib_id "pdf2kicad:FT230XS")', rendered)
+        self.assertNotIn("pdf2kicad:U48_1", rendered)
+
+    def test_repeated_and_unsafe_values_get_deterministic_suffixes(self):
+        first = component("U1")
+        first["value"] = "USB/UART bridge"
+        second = component("U2")
+        second["value"] = "USB/UART bridge"
+        colliding_suffix = component("U3")
+        colliding_suffix["value"] = "USB_UART_bridge_2"
+
+        rendered = self.render(first, second, colliding_suffix)
+
+        self.assertIn('(lib_id "pdf2kicad:USB_UART_bridge")', rendered)
+        self.assertIn('(lib_id "pdf2kicad:USB_UART_bridge_2")', rendered)
+        self.assertIn('(lib_id "pdf2kicad:USB_UART_bridge_2_2")', rendered)
+
+    def test_multi_unit_members_share_the_value_based_name(self):
+        unit_a = component("U7A")
+        unit_a["value"] = "Controller"
+        unit_b = component("U7B")
+        unit_b["value"] = "Controller"
+        pdf2kicad.detect_multi_units(
+            [{"components": [unit_a, unit_b]}]
+        )
+
+        self.assertEqual(
+            pdf2kicad._component_lib_ids([unit_a, unit_b]),
+            ["pdf2kicad:Controller", "pdf2kicad:Controller"],
+        )
+
+
 class PowerSymbolTests(unittest.TestCase):
     def test_supply_bar_is_consumed_and_becomes_native_power_symbol(self):
         power_text = {
@@ -2364,10 +2426,11 @@ class PowerSymbolTests(unittest.TestCase):
             "example",
             "/root/sheet",
         )
-        self.assertIn('(symbol "power:VDD_CORE"', definition)
-        self.assertIn("(power)", definition)
+        self.assertIn('(symbol "power:VCC"', definition)
+        self.assertIn("(power global)", definition)
         self.assertIn("(pin power_in line", definition)
-        self.assertIn('(lib_id "power:VDD_CORE")', placement)
+        self.assertIn('(lib_id "power:VCC")', placement)
+        self.assertIn('(property "Value" "VDD_CORE"', placement)
         self.assertIn('(reference "#PWR0001")', placement)
         self.assertIn('(project "example"', placement)
         self.assertIn('(path "/root/sheet"', placement)
@@ -2399,6 +2462,69 @@ class PowerSymbolTests(unittest.TestCase):
         self.assertNotIn("(global_label", rendered)
         self.assertNotIn('(text "VDD_CORE"', rendered)
         self.assertNotIn("(color 0 0 0 1)", rendered)
+
+    def test_existing_power_name_is_used_case_insensitively(self):
+        power = {
+            "name": "vdd",
+            "glyph": "supply",
+            "point": (10.0, 10.0),
+        }
+
+        self.assertEqual(pdf2kicad._power_lib_name(power), "VDD")
+        self.assertIn(
+            '(lib_id "power:VDD")',
+            pdf2kicad._power_symbol_instance(
+                pdf2kicad.UuidFactory(b"known-power-name"),
+                pdf2kicad.coordinate_transform("A4"),
+                power,
+            ),
+        )
+
+    def test_unknown_ground_defaults_to_existing_gnd_symbol(self):
+        power = {
+            "name": "ADAVSS",
+            "glyph": "ground",
+            "point": (10.0, 10.0),
+        }
+
+        self.assertEqual(pdf2kicad._power_lib_name(power), "GND")
+
+    def test_unknown_supplies_share_one_stock_vcc_definition(self):
+        powers = [
+            {
+                "name": name,
+                "glyph": "supply",
+                "point": (10.0 + index, 10.0),
+                "reference": f"#PWR{index + 1:04d}",
+            }
+            for index, name in enumerate(("VDD_CORE", "VDD_IO"))
+        ]
+        rendered = pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"shared-vcc"),
+            {"lines": [], "rectangles": [], "curves": [], "texts": []},
+            {
+                "components": [],
+                "wires": [],
+                "power_ports": powers,
+                "global_labels": [],
+                "local_labels": [],
+                "consumed_texts": set(),
+                "semantic_lines": set(),
+                "semantic_rectangles": set(),
+                "semantic_curves": set(),
+                "worksheet": None,
+            },
+            pdf2kicad.coordinate_transform("A4"),
+            "Shared VCC",
+            False,
+        )
+
+        self.assertEqual(rendered.count('(symbol "power:VCC"\n'), 1)
+        self.assertEqual(rendered.count('(lib_id "power:VCC")'), 2)
+        self.assertIn('(property "Value" "VDD_CORE"', rendered)
+        self.assertIn('(property "Value" "VDD_IO"', rendered)
+        self.assertNotIn('power:VDD_CORE', rendered)
+        self.assertNotIn('power:VDD_IO', rendered)
 
     def test_ground_triangle_is_consumed_without_a_wire(self):
         page = {
