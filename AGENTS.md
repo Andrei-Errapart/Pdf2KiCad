@@ -74,27 +74,27 @@ Write a concise, imperative subject line that is understandable in `git log --on
 A prefix is optional. Add one, formatted as `prefix: subject`, only when at least one of these applies:
 
 - A ticket ID is available from the user request, branch name, issue, or surrounding commits (for example `SEI-2196:`).
-- The commit mostly concerns one project or component (for example `shopup6:` or `RestDbCore:`).
-- A topic clearly describes the nature of the change (for example `CI`, `Doku`, `Bereinigung`, `Tippfehler`, `Korrektur`).
+- The commit mostly concerns one project or component (for example `pdf2kicad:` or `pdf_dump:`).
+- A topic clearly describes the nature of the change (for example `CI`, `Docs`, `Cleanup`, `Typo`, `Fix`).
 
 Multiple prefixes are permitted when more than one applies; chain them with colons, for example `SEI-2196: CI: ...`. Omit the prefix when none of these reasons applies. Do not invent ticket IDs, scopes, or prefixes.
 
 Examples:
 
 ```text
-Login-Weiterleitung nach Sitzungsablauf korrigieren
+Fix login redirect after session expiry
 ```
 
 ```text
-ABC-123: Device-Tree-Overlay-Erzeugung aktualisieren
+ABC-123: Update device-tree overlay generation
 ```
 
 ```text
-CI: MSI-Kopier-Exitcode korrigieren
+CI: Fix MSI copy exit code
 ```
 
 ```text
-SEI-2196: CI: MSI-Kopier-Exitcode korrigieren
+SEI-2196: CI: Fix MSI copy exit code
 ```
 
 ### Body decision
