@@ -83,6 +83,71 @@ class CoordinateTransformTests(unittest.TestCase):
         )
 
 
+class PinLengthTests(unittest.TestCase):
+    @staticmethod
+    def named_two_pin_component():
+        return {
+            "reference": "U1",
+            "value": "Example IC",
+            "bbox": {
+                "x0": 10.0,
+                "y0": 10.0,
+                "x1": 15.0,
+                "y1": 15.0,
+            },
+            "body_lines": [],
+            "pins": [
+                {
+                    "number": "1",
+                    "name": "LEFT",
+                    "hot": {"x": 8.0, "y": 11.5},
+                    "other": {"x": 10.0, "y": 11.5},
+                    "length": 2.0,
+                },
+                {
+                    "number": "123",
+                    "name": "RIGHT",
+                    "hot": {"x": 17.0, "y": 13.5},
+                    "other": {"x": 15.0, "y": 13.5},
+                    "length": 2.0,
+                },
+            ],
+        }
+
+    def test_all_pins_fit_the_longest_visible_pin_number(self):
+        rendered = pdf2kicad._symbol_definition(
+            pdf2kicad.UuidFactory(b"elongated-pins"),
+            pdf2kicad.coordinate_transform("A4"),
+            self.named_two_pin_component(),
+            "pdf2kicad:U1",
+        )
+
+        self.assertEqual(rendered.count("(length 5.08)"), 2)
+        self.assertIn("(at -7.58 1.00 0)", rendered)
+        self.assertIn("(at 7.58 -1.00 180)", rendered)
+
+    def test_wire_endpoints_follow_elongated_pin_hotpoints(self):
+        part = self.named_two_pin_component()
+        relocations, bridges = pdf2kicad._pin_relocations(
+            [part],
+            pdf2kicad.coordinate_transform("A4"),
+            {},
+        )
+        wire = {
+            "start": {"x": 8.0, "y": 11.5},
+            "end": {"x": 3.0, "y": 11.5},
+        }
+
+        relocated = pdf2kicad._wire_with_relocated_pins(
+            wire,
+            relocations,
+        )
+
+        self.assertEqual(relocated["start"], {"x": 4.92, "y": 11.5})
+        self.assertEqual(relocated["end"], wire["end"])
+        self.assertEqual(bridges, [])
+
+
 class SheetNamingTests(unittest.TestCase):
     @staticmethod
     def page(number, *headings, components=None, wires=None):
