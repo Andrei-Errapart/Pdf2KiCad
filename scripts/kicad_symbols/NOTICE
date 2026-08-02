@@ -2,8 +2,10 @@ Third-party data bundled with pdf2kicad
 ========================================
 
 Device.kicad_sym is a reduced copy containing only the C, FerriteBead, L,
-and R symbols extracted from KiCad's Device symbol library. It is bundled so
-that --kicad-rcl works without a local KiCad installation.
+and R symbols extracted from KiCad's Device symbol library. Connector.kicad_sym
+contains only the TestPoint symbol from KiCad's Connector symbol library. They
+are bundled so standard-symbol substitution works without a local KiCad
+installation.
 
 Source:  KiCad Libraries — https://gitlab.com/kicad/libraries/kicad-symbols
 License: Creative Commons CC-BY-SA 4.0 with the KiCad Library Exception.
