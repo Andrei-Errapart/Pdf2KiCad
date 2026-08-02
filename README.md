@@ -44,6 +44,16 @@ designators remain pins rather than becoming bodyless components. Segmented
 round outlines used by ground points and testpoints are absorbed into their
 symbols instead of being emitted as standalone graphics.
 
+Values ending in `*DNP` are cleaned and emitted with KiCad's native
+do-not-populate state and BOM exclusion. Optional passive enrichment can infer
+generic KiCad SMD footprints from delimited imperial or metric package codes
+such as `0603` or `1608`. A separate rendering option replaces recovered
+two-terminal resistor, capacitor, inductor, and ferrite-bead bodies with the
+standard `Device:R`, `Device:C`, `Device:L`, and `Device:FerriteBead` symbols.
+Each required library definition is embedded once per sheet and shared by all
+matching instances. Four-pin filters, nonstandard pin-number pairs, and other
+multi-terminal magnetics are deliberately left unchanged.
+
 ## Usage
 
 ```sh
@@ -58,6 +68,8 @@ Useful options:
 ```text
 --paper auto|A0|A1|A2|A3|A4  select the source Capture sheet size
 --no-graphics                  omit the residual PDF vector/text trace
+--infer-footprints             infer SMD footprints for two-terminal passives
+--kicad-rcl                    use standard KiCad Device R/C/L/ferrite symbols
 --summary-json                 print machine-readable recovery counts
 ```
 

@@ -42,6 +42,7 @@ except ImportError:
 import pdf_dump
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 KICAD_VERSION = 20260306
 BODY_COLOR = pdf_dump.BODY_COLOR
 PIN_COLOR = pdf_dump.PIN_COLOR
@@ -62,6 +63,7 @@ KICAD_OUTLINE_FONT_COMPENSATION = 1.4
 ORCAD_TEXT_FACE = "Arial"
 PIN_LENGTH = 2.54
 PIN_TEXT_SIZE = 1.27
+DNP_SUFFIX_RE = re.compile(r"\s+\*DNP\s*$", re.IGNORECASE)
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
@@ -83,6 +85,58 @@ PAPER_SIZES = {
     "A3": (420.0, 297.0),
     "A4": (297.0, 210.0),
 }
+PASSIVE_PACKAGE_ALIASES = {
+    "01005": "01005",
+    "0201": "0201",
+    "0402": "0402",
+    "0603": "0603",
+    "0805": "0805",
+    "1005": "0402",
+    "1206": "1206",
+    "1210": "1210",
+    "1608": "0603",
+    "1812": "1812",
+    "2010": "2010",
+    "2012": "0805",
+    "2512": "2512",
+    "3216": "1206",
+    "3225": "1210",
+    "4532": "1812",
+    "5025": "2010",
+    "6332": "2512",
+}
+PASSIVE_FOOTPRINT_SUFFIXES = {
+    "01005": "01005_0402Metric",
+    "0201": "0201_0603Metric",
+    "0402": "0402_1005Metric",
+    "0603": "0603_1608Metric",
+    "0805": "0805_2012Metric",
+    "1206": "1206_3216Metric",
+    "1210": "1210_3225Metric",
+    "1812": "1812_4532Metric",
+    "2010": "2010_5025Metric",
+    "2512": "2512_6332Metric",
+}
+PASSIVE_FOOTPRINT_FAMILIES = {
+    "R": ("Resistor_SMD", "R"),
+    "C": ("Capacitor_SMD", "C"),
+    "L": ("Inductor_SMD", "L"),
+    "FB": ("Inductor_SMD", "L"),
+}
+STANDARD_PASSIVE_BODY_HALF_LENGTH = {
+    "R": 2.54,
+    "C": 1.016,
+    "L": 2.54,
+    "FB": 2.54,
+}
+STANDARD_PASSIVE_LIB_IDS = {
+    "R": "Device:R",
+    "C": "Device:C",
+    "L": "Device:L",
+    "FB": "Device:FerriteBead",
+}
+STANDARD_PASSIVE_PIN_OFFSET = 3.81
+_KICAD_DEVICE_SYMBOLS: dict[str, str] | None = None
 
 
 def _esc(value) -> str:
@@ -1706,6 +1760,175 @@ def _default_value(reference: str) -> str:
     return match.group(1) if match else "PDF_COMPONENT"
 
 
+def _passive_kind(component: dict) -> str | None:
+    reference = component.get("source_reference") or component.get(
+        "reference", ""
+    )
+    match = re.match(r"^(FB|R|C|L)\d", reference, re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def _load_kicad_device_symbols() -> dict[str, str]:
+    """Load the bundled standard Device symbols for passive substitution."""
+    global _KICAD_DEVICE_SYMBOLS
+    if _KICAD_DEVICE_SYMBOLS is not None:
+        return _KICAD_DEVICE_SYMBOLS
+
+    library_path = SCRIPT_DIR / "kicad_symbols" / "Device.kicad_sym"
+    content = library_path.read_text(encoding="utf-8")
+    loaded = {}
+    for kind, lib_id in STANDARD_PASSIVE_LIB_IDS.items():
+        name = lib_id.split(":", 1)[1]
+        marker = f'\t(symbol "{name}"'
+        start = content.find(marker)
+        if start < 0:
+            raise RuntimeError(f"{library_path} does not contain {name}")
+        depth = 0
+        seen_open = False
+        end = start
+        for end in range(start, len(content)):
+            if content[end] == "(":
+                depth += 1
+                seen_open = True
+            elif content[end] == ")":
+                depth -= 1
+            if seen_open and depth == 0:
+                end += 1
+                break
+        lines = content[start:end].splitlines()
+        loaded[kind] = (
+            "\n".join(
+                [f'\t\t(symbol "{lib_id}"']
+                + ["\t" + line for line in lines[1:]]
+            )
+            + "\n"
+        )
+    _KICAD_DEVICE_SYMBOLS = loaded
+    return loaded
+
+
+def _standard_passive_definition(kind: str) -> str:
+    return _load_kicad_device_symbols()[kind]
+
+
+def _passive_package_code(value: str) -> tuple[str, str] | None:
+    """Return (source code, imperial code) from a delimited value field."""
+    package_codes = "|".join(
+        sorted(PASSIVE_PACKAGE_ALIASES, key=len, reverse=True)
+    )
+    matches = list(
+        re.finditer(
+            rf"(?<![A-Za-z0-9])({package_codes})(?![A-Za-z0-9])",
+            value,
+        )
+    )
+    if not matches:
+        return None
+    source_code = matches[-1].group(1)
+    return source_code, PASSIVE_PACKAGE_ALIASES[source_code]
+
+
+def _infer_passive_footprint(component: dict) -> None:
+    kind = _passive_kind(component)
+    if kind is None or _two_terminal_axis(component) is None:
+        return
+    package = _passive_package_code(component.get("value", ""))
+    if package is None:
+        return
+    source_code, imperial_code = package
+    suffix = PASSIVE_FOOTPRINT_SUFFIXES.get(imperial_code)
+    family = PASSIVE_FOOTPRINT_FAMILIES.get(kind)
+    if suffix is None or family is None:
+        return
+    # KiCad does not provide generic 2010/2512 capacitor footprints.
+    if kind == "C" and imperial_code in ("2010", "2512"):
+        return
+    library, prefix = family
+    component["package"] = source_code
+    component["footprint"] = f"{library}:{prefix}_{suffix}"
+
+
+def _can_standardize_passive(
+    component: dict,
+    transform: CoordinateTransform,
+) -> bool:
+    kind = _passive_kind(component)
+    axis = _two_terminal_axis(component)
+    if kind is None or axis is None:
+        return False
+    pins = component["pins"]
+    if {str(pin.get("number")) for pin in pins} != {"1", "2"}:
+        return False
+    coordinate = "x" if axis == "horizontal" else "y"
+    center_coordinate = sum(pin["hot"][coordinate] for pin in pins) / 2
+    hot_distances = [
+        abs(pin["hot"][coordinate] - center_coordinate) * transform.scale
+        for pin in pins
+    ]
+    return min(hot_distances) > STANDARD_PASSIVE_BODY_HALF_LENGTH[kind] + 0.1
+
+
+def _configure_standard_passive(
+    component: dict,
+    transform: CoordinateTransform,
+) -> None:
+    """Record a stock Device symbol placement and its canonical hotpoints."""
+    kind = _passive_kind(component)
+    axis = _two_terminal_axis(component)
+    assert kind is not None and axis is not None
+    pins_by_number = {
+        str(pin["number"]): pin
+        for pin in component["pins"]
+    }
+    pin1 = pins_by_number["1"]
+    pin2 = pins_by_number["2"]
+    origin = (
+        (pin1["hot"]["x"] + pin2["hot"]["x"]) / 2,
+        (pin1["hot"]["y"] + pin2["hot"]["y"]) / 2,
+    )
+    if axis == "horizontal":
+        angle = 90 if pin1["hot"]["x"] < pin2["hot"]["x"] else 270
+        coordinate = "x"
+    else:
+        angle = 0 if pin1["hot"]["y"] > pin2["hot"]["y"] else 180
+        coordinate = "y"
+    offset = STANDARD_PASSIVE_PIN_OFFSET / transform.scale
+    center_coordinate = origin[0] if coordinate == "x" else origin[1]
+    hotpoints = {}
+    for number, pin in pins_by_number.items():
+        sign = 1 if pin["hot"][coordinate] > center_coordinate else -1
+        if axis == "horizontal":
+            hotpoints[number] = (origin[0] + sign * offset, origin[1])
+        else:
+            hotpoints[number] = (origin[0], origin[1] + sign * offset)
+
+    component["standard_passive"] = kind
+    component["standard_lib_id"] = STANDARD_PASSIVE_LIB_IDS[kind]
+    component["standard_origin"] = origin
+    component["standard_angle"] = angle
+    component["standard_hotpoints"] = hotpoints
+
+
+def _enrich_component(
+    component: dict,
+    transform: CoordinateTransform,
+    *,
+    infer_footprints: bool,
+    use_kicad_rcl: bool,
+) -> None:
+    """Normalize value metadata and enable requested passive enrichment."""
+    value = str(component.get("value") or "")
+    dnp_match = DNP_SUFFIX_RE.search(value)
+    component["dnp"] = bool(dnp_match)
+    if dnp_match:
+        component["value"] = value[:dnp_match.start()].rstrip()
+    component["_transform"] = transform
+    if infer_footprints:
+        _infer_passive_footprint(component)
+    if use_kicad_rcl and _can_standardize_passive(component, transform):
+        _configure_standard_passive(component, transform)
+
+
 def _local_label_anchor(text: dict) -> tuple[float, float]:
     bbox = _text_bbox(text)
     size = max(float(text.get("size") or 0), 0.1)
@@ -2718,8 +2941,17 @@ def detect_multi_units(semantics: list[dict]) -> dict[str, list[dict]]:
         # recovered value, which is also deterministic when only the generic
         # "U" fallback is available.
         shared_value = members[0]["value"]
+        shared_dnp = any(component.get("dnp", False) for component in members)
+        shared_footprints = {
+            component["footprint"]
+            for component in members
+            if component.get("footprint")
+        }
         for component in members:
             component["value"] = shared_value
+            component["dnp"] = shared_dnp
+            if len(shared_footprints) == 1:
+                component["footprint"] = next(iter(shared_footprints))
         groups[base] = members
     return groups
 
@@ -3012,9 +3244,51 @@ def _pin_direction(pin: dict) -> int:
     return 90 if dy > 0 else 270
 
 
+def _two_terminal_axis(component: dict) -> str | None:
+    """Return the common axis of a genuine two-terminal passive body."""
+    pins = component.get("pins", [])
+    if len(pins) != 2:
+        return None
+    vectors = [
+        (
+            pin["other"]["x"] - pin["hot"]["x"],
+            pin["other"]["y"] - pin["hot"]["y"],
+        )
+        for pin in pins
+    ]
+    lengths = [math.hypot(*vector) for vector in vectors]
+    if min(lengths) <= 0.01:
+        return None
+    dot = (
+        vectors[0][0] * vectors[1][0]
+        + vectors[0][1] * vectors[1][1]
+    )
+    cross = abs(
+        vectors[0][0] * vectors[1][1]
+        - vectors[0][1] * vectors[1][0]
+    )
+    if dot > -0.98 * lengths[0] * lengths[1]:
+        return None
+    if cross > 0.05 * lengths[0] * lengths[1]:
+        return None
+    hot_delta = (
+        pins[1]["hot"]["x"] - pins[0]["hot"]["x"],
+        pins[1]["hot"]["y"] - pins[0]["hot"]["y"],
+    )
+    hot_separation = math.hypot(*hot_delta)
+    hot_cross = abs(
+        vectors[0][0] * hot_delta[1]
+        - vectors[0][1] * hot_delta[0]
+    )
+    if hot_cross > 0.05 * lengths[0] * max(hot_separation, 0.01):
+        return None
+    return "horizontal" if abs(hot_delta[0]) >= abs(hot_delta[1]) else "vertical"
+
+
 def _pin_numbers_hidden(components: list[dict]) -> bool:
     return all(
-        len(component.get("pins", [])) == 1
+        component.get("standard_passive")
+        or len(component.get("pins", [])) == 1
         or _has_symmetric_two_pin_geometry(component)
         for component in components
     )
@@ -3042,6 +3316,9 @@ def _pin_for_output(
     """Return the PDF-space hotpoint and KiCad length for an emitted pin."""
     hot = (pin["hot"]["x"], pin["hot"]["y"])
     other = (pin["other"]["x"], pin["other"]["y"])
+    standard_hotpoints = component.get("standard_hotpoints")
+    if standard_hotpoints:
+        return standard_hotpoints[str(pin["number"])], PIN_LENGTH
     current_length = max(
         0.01,
         transform.delta(pin.get("length", _distance(hot, other))),
@@ -3118,6 +3395,13 @@ def _pin_relocations(
                 _pin_point_key(old_hot),
                 {"old": old_hot, "outputs": []},
             )
+            if component.get("standard_passive") and not any(
+                _point_close(old_hot, output, 0.001)
+                for output in record["outputs"]
+            ):
+                # Keep the recovered connection point stationary and bridge
+                # it to the stock Device pin when their spans differ.
+                record["outputs"].append(old_hot)
             if not any(
                 _point_close(new_hot, output, 0.001)
                 for output in record["outputs"]
@@ -3181,7 +3465,7 @@ def _wire_with_relocated_pins(
 
 def _has_symmetric_two_pin_geometry(component: dict) -> bool:
     pins = component.get("pins", [])
-    if len(pins) != 2 or any(
+    if _two_terminal_axis(component) is None or any(
         pin.get("name") not in (None, "", "~") for pin in pins
     ):
         return False
@@ -3197,28 +3481,7 @@ def _has_symmetric_two_pin_geometry(component: dict) -> bool:
         return False
     if abs(lengths[0] - lengths[1]) > max(lengths) * 0.05:
         return False
-    dot = (
-        vectors[0][0] * vectors[1][0]
-        + vectors[0][1] * vectors[1][1]
-    )
-    cross = abs(
-        vectors[0][0] * vectors[1][1]
-        - vectors[0][1] * vectors[1][0]
-    )
-    if dot > -0.98 * lengths[0] * lengths[1]:
-        return False
-    if cross > 0.05 * lengths[0] * lengths[1]:
-        return False
-    hot_delta = (
-        pins[1]["hot"]["x"] - pins[0]["hot"]["x"],
-        pins[1]["hot"]["y"] - pins[0]["hot"]["y"],
-    )
-    hot_separation = math.hypot(*hot_delta)
-    hot_cross = abs(
-        vectors[0][0] * hot_delta[1]
-        - vectors[0][1] * hot_delta[0]
-    )
-    return hot_cross <= 0.05 * lengths[0] * max(hot_separation, 0.01)
+    return True
 
 
 def _symbol_local_point(
@@ -3281,7 +3544,9 @@ def _symbol_unit_definition(
     for curve in component.get("body_curves", []):
         points = " ".join(
             f"(xy {x:.2f} {y:.2f})"
-            for x, y in (local(tuple(point)) for point in curve["points"])
+            for x, y in (
+                local(tuple(point)) for point in curve["points"]
+            )
         )
         width = max(0.15, transform.delta(curve.get("width", 0.1)))
         body.append(
@@ -3367,6 +3632,14 @@ def _symbol_definition(
         for pin in unit_component["pins"]
     ) else "\t\t\t(pin_names (offset 1.016))\n"
     hide_numbers = "\t\t\t(pin_numbers hide)\n" if hide_pin_numbers else ""
+    footprint = _esc(component.get("footprint") or "")
+    footprint_property = (
+        f'\t\t\t(property "Footprint" "{footprint}"\n'
+        "\t\t\t\t(at 0 0 0)\n"
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n"
+        "\t\t\t)\n"
+        if footprint else ""
+    )
     return (
         f'\t\t(symbol "{lib_id}"\n'
         "\t\t\t(exclude_from_sim no)\n"
@@ -3382,6 +3655,7 @@ def _symbol_definition(
         "\t\t\t\t(at 0 2.54 0)\n"
         "\t\t\t\t(effects (font (size 1.27 1.27)))\n"
         "\t\t\t)\n"
+        f"{footprint_property}"
         + "".join(
             _symbol_unit_definition(
                 unit_transform,
@@ -3406,11 +3680,12 @@ def _component_instance(
     instance_path: str = "/",
 ) -> str:
     bbox = component["bbox"]
-    origin = (
+    origin = component.get("standard_origin") or (
         (bbox["x0"] + bbox["x1"]) / 2,
         (bbox["y0"] + bbox["y1"]) / 2,
     )
     x, y = transform.xy(*origin)
+    instance_angle = int(component.get("standard_angle", 0)) % 360
     ref_text = component.get("reference_text")
     if ref_text:
         ref_at = transform.xy(
@@ -3443,20 +3718,24 @@ def _component_instance(
         value_at = (x, y + 2.54)
         value_angle = 0
         value_size = 1.27
+    ref_angle = (ref_angle - instance_angle) % 180
+    value_angle = (value_angle - instance_angle) % 180
     reference = _esc(component["reference"])
     value = _esc(component["value"])
+    footprint = _esc(component.get("footprint") or "")
+    dnp = bool(component.get("dnp"))
     unit = component.get("unit", 1)
     ref_style = _text_font_style(ref_text or {})
     value_style = _text_font_style(value_text or {})
     parts = [
         "\t(symbol\n",
         f'\t\t(lib_id "{lib_id}")\n',
-        f"\t\t(at {x:.2f} {y:.2f} 0)\n",
+        f"\t\t(at {x:.2f} {y:.2f} {instance_angle})\n",
         f"\t\t(unit {unit})\n",
         "\t\t(exclude_from_sim no)\n",
-        "\t\t(in_bom yes)\n",
+        f"\t\t(in_bom {'no' if dnp else 'yes'})\n",
         "\t\t(on_board yes)\n",
-        "\t\t(dnp no)\n",
+        f"\t\t(dnp {'yes' if dnp else 'no'})\n",
         f'\t\t(uuid "{factory.new("symbol")}")\n',
         f'\t\t(property "Reference" "{reference}"\n',
         f"\t\t\t(at {ref_at[0]:.2f} {ref_at[1]:.2f} {ref_angle})\n",
@@ -3469,6 +3748,15 @@ def _component_instance(
         f"(size {value_size:.2f} {value_size:.2f}){value_style}))\n",
         "\t\t)\n",
     ]
+    if footprint:
+        parts.extend(
+            [
+                f'\t\t(property "Footprint" "{footprint}"\n',
+                f"\t\t\t(at {x:.2f} {y:.2f} 0)\n",
+                "\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n",
+                "\t\t)\n",
+            ]
+        )
     for pin in component["pins"]:
         parts.extend(
             [
@@ -3620,7 +3908,10 @@ def render_page(
     emitted_definitions = set()
     for component in semantic["components"]:
         multi_unit = component.get("multi_unit")
-        if multi_unit:
+        standard_lib_id = component.get("standard_lib_id")
+        if standard_lib_id:
+            lib_id = standard_lib_id
+        elif multi_unit:
             safe_ref = re.sub(r"[^A-Za-z0-9_]+", "_", multi_unit)
             lib_id = f"pdf2kicad:{safe_ref}_multi"
         else:
@@ -3631,7 +3922,11 @@ def render_page(
         lib_ids.append(lib_id)
         if lib_id in emitted_definitions:
             continue
-        if multi_unit:
+        if standard_lib_id:
+            parts.append(
+                _standard_passive_definition(component["standard_passive"])
+            )
+        elif multi_unit:
             units = [
                 (member["unit"], member["_transform"], member)
                 for member in multi_unit_groups[multi_unit]
@@ -3880,6 +4175,8 @@ def convert_pdf(
     *,
     paper: str = "auto",
     keep_graphics: bool = True,
+    infer_footprints: bool = False,
+    use_kicad_rcl: bool = False,
 ) -> tuple[dict[str, str], dict]:
     pdf_bytes = pdf_path.read_bytes()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -3906,7 +4203,12 @@ def convert_pdf(
         transform = coordinate_transform(selected_paper)
         semantic = decode_page(page)
         for component in semantic["components"]:
-            component["_transform"] = transform
+            _enrich_component(
+                component,
+                transform,
+                infer_footprints=infer_footprints,
+                use_kicad_rcl=use_kicad_rcl,
+            )
         page_records.append(
             {
                 "index": index,
@@ -3964,6 +4266,10 @@ def convert_pdf(
                 "junctions": len(semantic["junctions"]),
                 "no_connects": len(semantic["no_connects"]),
                 "components": len(semantic["components"]),
+                "dnp_components": sum(
+                    bool(component.get("dnp"))
+                    for component in semantic["components"]
+                ),
                 "pins": sum(
                     len(component["pins"])
                     for component in semantic["components"]
@@ -3971,6 +4277,19 @@ def convert_pdf(
                 "local_labels": len(semantic["local_labels"]),
                 "global_labels": len(semantic["global_labels"]),
                 "power_ports": len(semantic["power_ports"]),
+                "inferred_footprints": [
+                    {
+                        "reference": component["reference"],
+                        "package": component["package"],
+                        "footprint": component["footprint"],
+                    }
+                    for component in semantic["components"]
+                    if component.get("footprint")
+                ],
+                "standardized_passives": sum(
+                    bool(component.get("standard_passive"))
+                    for component in semantic["components"]
+                ),
                 "worksheet": (
                     (semantic.get("worksheet") or {}).get("fields")
                     if semantic.get("worksheet") else None
@@ -4030,6 +4349,16 @@ def main() -> None:
         help="Emit semantic schematic objects only, omitting residual PDF graphics",
     )
     parser.add_argument(
+        "--infer-footprints",
+        action="store_true",
+        help="Infer standard KiCad footprints for two-terminal SMD passives",
+    )
+    parser.add_argument(
+        "--kicad-rcl",
+        action="store_true",
+        help="Use standard KiCad Device symbols for two-terminal passives",
+    )
+    parser.add_argument(
         "--summary-json",
         action="store_true",
         help="Print the conversion summary as JSON",
@@ -4044,6 +4373,8 @@ def main() -> None:
         args.pdf,
         paper=args.paper,
         keep_graphics=not args.no_graphics,
+        infer_footprints=args.infer_footprints,
+        use_kicad_rcl=args.kicad_rcl,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in output.items():
@@ -4072,6 +4403,9 @@ def main() -> None:
                 f"{page['junctions']} junctions, "
                 f"{page['no_connects']} no-connects, "
                 f"{page['components']} components, {page['pins']} pins, "
+                f"{page['dnp_components']} DNP, "
+                f"{len(page['inferred_footprints'])} footprints, "
+                f"{page['standardized_passives']} standard passives, "
                 f"{page['local_labels']} local labels, "
                 f"{page['global_labels']} global labels, "
                 f"{page['power_ports']} power ports",
