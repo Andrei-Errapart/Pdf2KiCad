@@ -53,6 +53,7 @@ REF_RE = pdf_dump.REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
 BODY_CURVE_JOIN_TOL = 0.06
 BODY_HALF_JOIN_TOL = 1.5
+TRANSISTOR_GATE_JOIN_TOL = 0.55
 REFERENCE_DIRECTION_TOL = 0.8
 JUNCTION_COLOR = "#ff0000"
 NO_CONNECT_COLOR = "#803f00"
@@ -135,6 +136,7 @@ STANDARD_PASSIVE_LIB_IDS = {
     "L": "Device:L",
     "FB": "Device:FerriteBead",
 }
+STANDARD_TESTPOINT_LIB_ID = "Connector:TestPoint"
 STANDARD_POWER_NAMES = (
     "+10V", "+12C", "+12L", "+12LF", "+12P", "+12V", "+12VA",
     "+15V", "+1V0", "+1V1", "+1V2", "+1V35", "+1V5", "+1V8",
@@ -155,7 +157,7 @@ STANDARD_POWER_NAME_MAP = {
     name.upper(): name for name in STANDARD_POWER_NAMES
 }
 STANDARD_PASSIVE_PIN_OFFSET = 3.81
-_KICAD_DEVICE_SYMBOLS: dict[str, str] | None = None
+_KICAD_STANDARD_SYMBOLS: dict[str, str] = {}
 
 
 def _esc(value) -> str:
@@ -336,7 +338,7 @@ def _looks_like_passive_value(value: str) -> bool:
 
 
 def _split_merged_reference_values(page: dict) -> None:
-    """Split Capture text spans such as ``R13110K/0603``.
+    """Split Capture text spans such as ``R13110K/0603`` and ``TP21TP_PAD``.
 
     PyMuPDF can coalesce adjacent reference and value fields into one span.
     References elsewhere on the page disambiguate the run of digits: on a
@@ -366,6 +368,27 @@ def _split_merged_reference_values(page: dict) -> None:
             text.get("color") != "#000000"
             or REF_RE.fullmatch(original)
         ):
+            continue
+        testpoint_match = re.fullmatch(
+            r"(TP\d+[A-Z]?)(TP_PAD)",
+            original,
+            re.IGNORECASE,
+        )
+        if testpoint_match:
+            reference, value = testpoint_match.groups()
+            reference_text = {**text, "text": reference}
+            value_text = {**text, "text": value}
+            split_fraction = len(reference) / len(original)
+            if int(round(text.get("angle", 0))) % 180 == 0:
+                split = text["x"] + (text["x1"] - text["x"]) * split_fraction
+                reference_text["x1"] = split
+                value_text["x"] = split
+            else:
+                split = text["y"] + (text["y1"] - text["y"]) * split_fraction
+                reference_text["y1"] = split
+                value_text["y"] = split
+            texts[index] = reference_text
+            additions.append(value_text)
             continue
         match = MERGED_PASSIVE_PREFIX_RE.match(original)
         if not match:
@@ -1269,22 +1292,48 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
     reference_prefix = (
         reference_match.group(1).upper() if reference_match else ""
     )
-    for index, line in enumerate(page["lines"]):
+    remaining_body_lines = [
+        (index, line, _bbox_for_lines([line]))
+        for index, line in enumerate(page["lines"])
         if (
-            (
-                line.get("color") == BODY_COLOR
-                or (
-                    reference_prefix in ("D", "LD")
-                    and line.get("color") is None
-                    and float(line.get("width") or 0.0) == 0.0
-                )
+            line.get("color") == BODY_COLOR
+            or (
+                reference_prefix in ("D", "LD")
+                and line.get("color") is None
+                and float(line.get("width") or 0.0) == 0.0
             )
-            and _bboxes_touch(_bbox_for_lines([line]), bbox, GEOM_TOL)
-        ):
+        )
+    ]
+    body_join_tolerance = (
+        TRANSISTOR_GATE_JOIN_TOL
+        if reference_prefix == "Q"
+        else GEOM_TOL
+    )
+    if reference_prefix in ("D", "LD", "Q"):
+        changed = True
+        while changed:
+            changed = False
+            for candidate in list(remaining_body_lines):
+                index, line, line_bbox = candidate
+                if not _bboxes_touch(
+                    line_bbox,
+                    bbox,
+                    body_join_tolerance,
+                ):
+                    continue
+                body_lines.append(line)
+                component_line_indexes.add(index)
+                bbox = _bbox_union(bbox, line_bbox)
+                remaining_body_lines.remove(candidate)
+                changed = True
+    else:
+        for index, line, line_bbox in remaining_body_lines:
+            if not _bboxes_touch(line_bbox, bbox, GEOM_TOL):
+                continue
             body_lines.append(line)
             component_line_indexes.add(index)
-    if body_lines:
-        bbox = _bbox_union(bbox, _bbox_for_lines(body_lines))
+        if body_lines:
+            bbox = _bbox_union(bbox, _bbox_for_lines(body_lines))
 
     curve_indexes = {
         index
@@ -1792,47 +1841,44 @@ def _passive_kind(component: dict) -> str | None:
     return match.group(1).upper() if match else None
 
 
-def _load_kicad_device_symbols() -> dict[str, str]:
-    """Load the bundled standard Device symbols for passive substitution."""
-    global _KICAD_DEVICE_SYMBOLS
-    if _KICAD_DEVICE_SYMBOLS is not None:
-        return _KICAD_DEVICE_SYMBOLS
+def _standard_symbol_definition(lib_id: str) -> str:
+    """Load one bundled KiCad library symbol under its canonical ID."""
+    if lib_id in _KICAD_STANDARD_SYMBOLS:
+        return _KICAD_STANDARD_SYMBOLS[lib_id]
 
-    library_path = SCRIPT_DIR / "kicad_symbols" / "Device.kicad_sym"
+    library, name = lib_id.split(":", 1)
+    library_path = SCRIPT_DIR / "kicad_symbols" / f"{library}.kicad_sym"
     content = library_path.read_text(encoding="utf-8")
-    loaded = {}
-    for kind, lib_id in STANDARD_PASSIVE_LIB_IDS.items():
-        name = lib_id.split(":", 1)[1]
-        marker = f'\t(symbol "{name}"'
-        start = content.find(marker)
-        if start < 0:
-            raise RuntimeError(f"{library_path} does not contain {name}")
-        depth = 0
-        seen_open = False
-        end = start
-        for end in range(start, len(content)):
-            if content[end] == "(":
-                depth += 1
-                seen_open = True
-            elif content[end] == ")":
-                depth -= 1
-            if seen_open and depth == 0:
-                end += 1
-                break
-        lines = content[start:end].splitlines()
-        loaded[kind] = (
-            "\n".join(
-                [f'\t\t(symbol "{lib_id}"']
-                + ["\t" + line for line in lines[1:]]
-            )
-            + "\n"
+    marker = f'\t(symbol "{name}"'
+    start = content.find(marker)
+    if start < 0:
+        raise RuntimeError(f"{library_path} does not contain {name}")
+    depth = 0
+    seen_open = False
+    end = start
+    for end in range(start, len(content)):
+        if content[end] == "(":
+            depth += 1
+            seen_open = True
+        elif content[end] == ")":
+            depth -= 1
+        if seen_open and depth == 0:
+            end += 1
+            break
+    lines = content[start:end].splitlines()
+    definition = (
+        "\n".join(
+            [f'\t\t(symbol "{lib_id}"']
+            + ["\t" + line for line in lines[1:]]
         )
-    _KICAD_DEVICE_SYMBOLS = loaded
-    return loaded
+        + "\n"
+    )
+    _KICAD_STANDARD_SYMBOLS[lib_id] = definition
+    return definition
 
 
 def _standard_passive_definition(kind: str) -> str:
-    return _load_kicad_device_symbols()[kind]
+    return _standard_symbol_definition(STANDARD_PASSIVE_LIB_IDS[kind])
 
 
 def _passive_package_code(value: str) -> tuple[str, str] | None:
@@ -1933,6 +1979,27 @@ def _configure_standard_passive(
     component["standard_hotpoints"] = hotpoints
 
 
+def _configure_standard_testpoint(component: dict) -> None:
+    """Place KiCad's stock TestPoint with its pin on the recovered hotpoint."""
+    if (
+        not re.fullmatch(
+            r"TP\d+[A-Z]?",
+            component.get("reference", ""),
+            re.IGNORECASE,
+        )
+        or len(component.get("pins", [])) != 1
+        or str(component["pins"][0].get("number")) != "1"
+    ):
+        return
+    pin = component["pins"][0]
+    hotpoint = (pin["hot"]["x"], pin["hot"]["y"])
+    component["standard_testpoint"] = True
+    component["standard_lib_id"] = STANDARD_TESTPOINT_LIB_ID
+    component["standard_origin"] = hotpoint
+    component["standard_angle"] = (_pin_direction(pin) - 90) % 360
+    component["standard_hotpoints"] = {"1": hotpoint}
+
+
 def _enrich_component(
     component: dict,
     transform: CoordinateTransform,
@@ -1947,6 +2014,7 @@ def _enrich_component(
     if dnp_match:
         component["value"] = value[:dnp_match.start()].rstrip()
     component["_transform"] = transform
+    _configure_standard_testpoint(component)
     if infer_footprints:
         _infer_passive_footprint(component)
     if use_kicad_rcl and _can_standardize_passive(component, transform):
@@ -2036,6 +2104,11 @@ def assign_values(
                 cross_offset = dx
                 along_distance = abs(dy)
             passive_prefix = reference_prefix in ("R", "C", "L", "FB")
+            ordering_code_penalty = (
+                20.0
+                if passive_prefix and not _looks_like_passive_value(value)
+                else 0.0
+            )
             if (
                 same_angle
                 and bbox_distance <= 6.0
@@ -2051,6 +2124,7 @@ def assign_values(
                     bbox_distance
                     + cross_distance * 4.0
                     + along_distance * 0.05
+                    + ordering_code_penalty
                     + max(
                         0.0,
                         -cross_offset - REFERENCE_DIRECTION_TOL,
@@ -2102,7 +2176,8 @@ def assign_values(
                         (
                             body_distance
                             + _distance(text_center, component_center) * 0.2
-                            + (0.0 if same_angle else 0.5),
+                            + (0.0 if same_angle else 0.5)
+                            + ordering_code_penalty,
                             component_index,
                             text_index,
                             key,
@@ -3995,9 +4070,7 @@ def render_page(
         if lib_id in emitted_definitions:
             continue
         if standard_lib_id:
-            parts.append(
-                _standard_passive_definition(component["standard_passive"])
-            )
+            parts.append(_standard_symbol_definition(standard_lib_id))
         elif multi_unit:
             units = [
                 (member["unit"], member["_transform"], member)

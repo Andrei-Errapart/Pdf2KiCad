@@ -338,6 +338,45 @@ class ComponentEnrichmentTests(unittest.TestCase):
 
         self.assertNotIn("standard_passive", part)
 
+    def test_testpoint_uses_stock_connector_symbol_at_recovered_hotpoint(self):
+        part = component("TP21")
+        part["value"] = "TP_PAD"
+        part["pins"][0].update({
+            "hot": {"x": 12.5, "y": 18.0},
+            "other": {"x": 12.5, "y": 15.0},
+            "length": 3.0,
+        })
+
+        self.enrich(part)
+        rendered = pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"standard-testpoint"),
+            {"lines": [], "rectangles": [], "curves": [], "texts": []},
+            {
+                "components": [part],
+                "wires": [],
+                "power_ports": [],
+                "global_labels": [],
+                "local_labels": [],
+                "consumed_texts": set(),
+                "semantic_lines": set(),
+                "semantic_rectangles": set(),
+                "semantic_curves": set(),
+                "worksheet": None,
+            },
+            pdf2kicad.coordinate_transform("A4"),
+            "Stock testpoint",
+            False,
+        )
+
+        self.assertTrue(part["standard_testpoint"])
+        self.assertEqual(part["standard_lib_id"], "Connector:TestPoint")
+        self.assertEqual(part["standard_origin"], (12.5, 18.0))
+        self.assertEqual(part["standard_angle"], 0)
+        self.assertEqual(rendered.count('(symbol "Connector:TestPoint"\n'), 1)
+        self.assertIn('(lib_id "Connector:TestPoint")', rendered)
+        self.assertIn('(property "Value" "TP_PAD"', rendered)
+        self.assertNotIn('(symbol "pdf2kicad:TP_PAD"', rendered)
+
 
 class SheetNamingTests(unittest.TestCase):
     @staticmethod
@@ -1243,6 +1282,77 @@ class SemanticRecoveryTests(unittest.TestCase):
             {"x0": 9.0, "y0": 9.0, "x1": 11.0, "y1": 11.0},
         )
 
+    def test_transistor_gate_fragment_and_third_pin_are_recovered(self):
+        reference = self.semantic_text("Q1", 13.0, 11.0, 15.0, 12.0)
+        pin_numbers = [
+            self.semantic_text("1", 7.0, 13.0, 8.0, 14.0),
+            self.semantic_text("3", 11.0, 7.5, 12.0, 8.5, 90),
+            self.semantic_text("2", 11.0, 15.5, 12.0, 16.5, 90),
+        ]
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 12.0, 10.0, 12.0, 14.0),
+                line(pdf2kicad.PIN_COLOR, 12.0, 8.0, 12.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 12.0, 14.0, 12.0, 16.0),
+                line(pdf2kicad.BODY_COLOR, 11.5, 10.0, 11.5, 14.0),
+                line(pdf2kicad.BODY_COLOR, 10.0, 14.0, 11.5, 14.0),
+                line(pdf2kicad.PIN_COLOR, 8.0, 14.0, 10.0, 14.0),
+            ],
+            "rectangles": [],
+            "curves": [],
+            "texts": [reference, *pin_numbers],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, consumed_texts, consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+        recovered = components[0]
+
+        self.assertEqual(recovered["reference"], "Q1")
+        self.assertEqual(len(recovered["pins"]), 3)
+        self.assertEqual(
+            {
+                (pin["hot"]["x"], pin["hot"]["y"]): pin["number"]
+                for pin in recovered["pins"]
+            },
+            {(8.0, 14.0): "1", (12.0, 8.0): "3", (12.0, 16.0): "2"},
+        )
+        self.assertEqual(consumed_lines, set(range(6)))
+        for number in pin_numbers:
+            self.assertIn(pdf2kicad._text_key(number), consumed_texts)
+
+    def test_diode_kink_strokes_are_recovered_through_main_bar(self):
+        reference = self.semantic_text("D1", 13.0, 11.0, 15.0, 12.0)
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 12.0, 10.0, 12.0, 14.0),
+                line(pdf2kicad.PIN_COLOR, 12.0, 8.0, 12.0, 10.0),
+                line(pdf2kicad.PIN_COLOR, 12.0, 14.0, 12.0, 16.0),
+                line(pdf2kicad.BODY_COLOR, 11.0, 12.0, 13.0, 12.0),
+                line(pdf2kicad.BODY_COLOR, 10.5, 12.5, 11.0, 12.0),
+                line(pdf2kicad.BODY_COLOR, 13.0, 12.0, 13.5, 11.5),
+            ],
+            "rectangles": [],
+            "curves": [],
+            "texts": [reference],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, _consumed_texts, consumed_lines = (
+            pdf2kicad.decode_components(page)
+        )
+
+        self.assertEqual(components[0]["reference"], "D1")
+        self.assertEqual(len(components[0]["body_lines"]), 4)
+        self.assertEqual(consumed_lines, set(range(6)))
+
     def test_ferrite_curves_and_second_pin_are_part_of_symbol(self):
         reference = {
             "text": "FB1",
@@ -1400,6 +1510,107 @@ class SemanticRecoveryTests(unittest.TestCase):
             "R13110K/0603",
             [text["text"] for text in page["texts"]],
         )
+
+    def test_human_passive_value_wins_over_manufacturer_ordering_code(self):
+        capacitor_reference = self.semantic_text(
+            "C638", 10.0, 10.0, 11.0, 14.0, 90
+        )
+        resistor_reference = self.semantic_text(
+            "R268", 50.0, 10.0, 54.0, 11.0
+        )
+        capacitor_ordering_code = self.semantic_text(
+            "EEEFK1V221AP", 11.0, 8.0, 12.0, 14.0, 90
+        )
+        capacitor_value = self.semantic_text(
+            "220u/35V/ALUM", 12.0, 8.0, 13.0, 14.0, 90
+        )
+        resistor_ordering_code = self.semantic_text(
+            "PMR18EZPFU10L0", 50.0, 11.0, 60.0, 12.0
+        )
+        resistor_value = self.semantic_text(
+            "10mohm/3216/1%/1W", 50.0, 12.0, 62.0, 13.0
+        )
+        components = [
+            {
+                "reference": "C638",
+                "reference_text": capacitor_reference,
+                "bbox": {"x0": 8.0, "y0": 10.0, "x1": 9.0, "y1": 14.0},
+            },
+            {
+                "reference": "R268",
+                "reference_text": resistor_reference,
+                "bbox": {"x0": 50.0, "y0": 8.0, "x1": 54.0, "y1": 9.0},
+            },
+        ]
+        consumed = {
+            pdf2kicad._text_key(capacitor_reference),
+            pdf2kicad._text_key(resistor_reference),
+        }
+
+        pdf2kicad.assign_values(
+            {
+                "texts": [
+                    capacitor_reference,
+                    capacitor_ordering_code,
+                    capacitor_value,
+                    resistor_reference,
+                    resistor_ordering_code,
+                    resistor_value,
+                ],
+            },
+            components,
+            consumed,
+        )
+
+        self.assertEqual(
+            [part["value"] for part in components],
+            ["220u/35V/ALUM", "10mohm/3216/1%/1W"],
+        )
+
+    def test_coalesced_testpoint_reference_and_value_are_split(self):
+        merged = self.semantic_text(
+            "TP21TP_PAD", 13.5, 8.0, 20.5, 9.0
+        )
+        page = {
+            "lines": [
+                line(pdf2kicad.BODY_COLOR, 12.0, 12.0, 12.0, 13.0),
+                line(pdf2kicad.PIN_COLOR, 12.0, 13.0, 12.0, 15.0),
+            ],
+            "rectangles": [],
+            "curves": [
+                {
+                    "points": points,
+                    "color": pdf2kicad.BODY_COLOR,
+                    "fill": pdf2kicad.BODY_COLOR,
+                    "width": 0.1,
+                }
+                for points in (
+                    [[12.0, 10.0], [13.0, 11.0]],
+                    [[13.0, 11.0], [12.0, 12.0]],
+                    [[12.0, 12.0], [11.0, 11.0]],
+                    [[11.0, 11.0], [12.0, 10.0]],
+                )
+            ],
+            "texts": [merged],
+            "decoded": {
+                "components": [],
+                "wires": [],
+            },
+        }
+
+        components, consumed, consumed_lines = pdf2kicad.decode_components(page)
+        pdf2kicad.assign_values(page, components, consumed)
+
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0]["reference"], "TP21")
+        self.assertEqual(components[0]["value"], "TP_PAD")
+        self.assertEqual(len(components[0]["pins"]), 1)
+        self.assertEqual(components[0]["curve_indexes"], {0, 1, 2, 3})
+        self.assertEqual(consumed_lines, {0, 1})
+        split_reference, split_value = page["texts"]
+        self.assertEqual(split_reference["text"], "TP21")
+        self.assertEqual(split_value["text"], "TP_PAD")
+        self.assertEqual(split_reference["x1"], split_value["x"])
 
     def test_connector_designator_like_pin_labels_stay_on_body(self):
         def text(value, x, y, x1, y1, angle=0):
