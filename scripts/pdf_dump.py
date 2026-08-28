@@ -42,6 +42,25 @@ GLOBAL_LABEL_TEXT_COLOR = "#ff0000"
 GLOBAL_LABEL_PAGE_REFERENCE_RE = re.compile(
     r"<[0-9]+(?:\s*,\s*[0-9]+)*>"
 )
+NO_CONNECT_COLOR = "#803f00"
+
+# Altium Designer PDFs (llPDFLib) draw wires, pins, and bodies with the
+# default Altium scheme below.  normalize_altium_page() maps those primitives
+# onto the OrCAD colors above so one decode pipeline serves both flavors; the
+# original color is preserved in "source_color" for graphics emission.
+ALTIUM_WIRE_COLOR = "#000080"
+ALTIUM_GRAPHIC_COLOR = "#0000ff"
+ALTIUM_BODY_FILL = "#ffffb0"
+ALTIUM_ACCENT_COLOR = "#800000"  # body outlines, power glyphs, net labels
+ALTIUM_JUNCTION_FILLS = ("#4b4b94", "#4c4c94")
+ALTIUM_NOERC_COLOR = "#ff0000"
+ALTIUM_TEXT_COLOR = "#000080"  # designators, values, comments
+# Not-fitted variant parts print dimmed: gray symbols/texts, pink power
+# glyphs.  Text spans carry the exact color; stroked paths lose one LSB to
+# float truncation.
+ALTIUM_DNP_COLOR = "#bfbfbf"
+ALTIUM_DNP_DRAW_COLORS = ("#bebebe", "#bfbfbf")
+ALTIUM_DIMMED_ACCENT_COLOR = "#d0a2a2"
 GEOM_TOL = 0.18
 EDGE_TOL = 0.30
 MIN_SYMBOL_W = 2.0
@@ -52,8 +71,25 @@ CHEVRON_MIN_ARM = 0.25
 CHEVRON_MAX_ARM = 3.0
 CHEVRON_POINT_TOL = 0.12
 REF_RE = re.compile(
-    r"^(?:U|CN|PCIE|JSW|J|P|R|C|LD|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SP|X|F|VR)\d+[A-Z]?$"
+    r"^(?:U|CN|PCIE|JSW|J|P|R|C|LD|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SNAP"
+    r"|SP|S|X|F|VR|V|H|MECH|MP|PM|KK|T)\d+[A-Z]?$"
 )
+# Annotation tokens that look like references but never are.
+REFERENCE_STOP_WORDS = {"X5R", "X6S", "X7R", "X8R", "C0G", "NP0", "Y5V", "Z5U"}
+
+
+def is_reference_text(text: dict, flavor: str | None = None) -> bool:
+    """Whether a text span can name a component reference."""
+    value = text.get("text", "").strip()
+    if not REF_RE.match(value) or value.upper() in REFERENCE_STOP_WORDS:
+        return False
+    if text.get("color") != "#000000":
+        return False
+    if flavor == "altium" and not text.get("font", "").startswith("Times"):
+        # Altium designators are Times New Roman; Courier hits are pin
+        # names (BGA balls like H65) and Arial hits are annotations.
+        return False
+    return True
 
 
 def pt2mm(pt: float) -> float:
@@ -422,14 +458,13 @@ def _text_center(text: dict) -> tuple[float, float]:
     return ((text["x"] + text["x1"]) / 2, (text["y"] + text["y1"]) / 2)
 
 
-def _nearest_reference(bbox: dict, texts: list[dict]) -> dict | None:
+def _nearest_reference(
+    bbox: dict, texts: list[dict], flavor: str | None = None
+) -> dict | None:
     refs = [
         text
         for text in texts
-        if (
-            text.get("color") == "#000000"
-            and REF_RE.match(text.get("text", ""))
-        )
+        if is_reference_text(text, flavor)
     ]
     if not refs:
         return None
@@ -453,6 +488,7 @@ def _nearest_reference(bbox: dict, texts: list[dict]) -> dict | None:
         "x1": best["x1"],
         "y1": best["y1"],
         "angle": best["angle"],
+        **({"dnp": True} if best.get("dnp") else {}),
     }
 
 
@@ -464,7 +500,9 @@ def _pin_orientation(pin: dict) -> str:
     return "up" if dy < 0 else "down"
 
 
-def _pin_number_candidates(texts: list[dict]) -> list[dict]:
+def _pin_number_candidates(
+    texts: list[dict], flavor: str | None = None
+) -> list[dict]:
     candidates = []
     for text in texts:
         value = text.get("text", "").strip()
@@ -474,6 +512,11 @@ def _pin_number_candidates(texts: list[dict]) -> list[dict]:
             or text.get("color") != PIN_NUMBER_COLOR
             or not any(ch.isdigit() for ch in value)
         ):
+            continue
+        if flavor == "altium" and "source_color" in text:
+            # Recolored spans are designators, values, or DNP texts (a gray
+            # "R210" would otherwise become a pin number); Altium pin
+            # numbers are natively black.
             continue
         candidates.append(text)
     return candidates
@@ -610,13 +653,14 @@ def _pins_for_body(
     texts: list[dict],
     reference_text: dict | None = None,
     curves: list[dict] | None = None,
+    flavor: str | None = None,
 ) -> list[dict]:
     pins = []
     center = ((bbox["x0"] + bbox["x1"]) / 2, (bbox["y0"] + bbox["y1"]) / 2)
     seen = set()
     inverted_bubbles = _inverted_pin_bubbles(bbox, curves or [])
     used_bubbles = set()
-    pin_number_texts = _pin_number_candidates(texts)
+    pin_number_texts = _pin_number_candidates(texts, flavor)
     pin_name_texts = _pin_name_candidates(texts)
     if reference_text:
         pin_number_texts = [
@@ -1669,17 +1713,367 @@ def decode_worksheet(page_data: dict) -> dict | None:
     }
 
 
+def detect_flavor(metadata: dict | None) -> str:
+    """Classify the authoring EDA tool from the PDF document metadata."""
+    blob = " ".join(
+        str((metadata or {}).get(key) or "")
+        for key in ("creator", "producer")
+    )
+    return "altium" if "altium" in blob.lower() else "orcad"
+
+
+def _remember_color(obj: dict, key: str = "color") -> None:
+    if "source_" + key not in obj:
+        obj["source_" + key] = obj.get(key)
+
+
+def _is_solid(line: dict) -> bool:
+    return not line.get("dashed")
+
+
+def _altium_titleblock_bbox(page_data: dict) -> dict:
+    """The bottom-right sheet-template region holding title/date/page texts."""
+    width = page_data.get("width") or 0.0
+    height = page_data.get("height") or 0.0
+    return {
+        "x0": width * 0.60,
+        "y0": height * 0.84,
+        "x1": width,
+        "y1": height,
+    }
+
+
+def _altium_body_boxes(page_data: dict) -> list[dict]:
+    """Component body bounding boxes from the pale-yellow Altium body fill."""
+    lines = page_data["lines"]
+    fill_records = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if line.get("fill") == ALTIUM_BODY_FILL and not line.get("color")
+    ]
+    parent = list(range(len(fill_records)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    endpoints = {}
+    for record_index, (_index, line) in enumerate(fill_records):
+        for x, y in _line_points(line):
+            key = (round(x / GEOM_TOL), round(y / GEOM_TOL))
+            for other in endpoints.get(key, []):
+                union(record_index, other)
+            endpoints.setdefault(key, []).append(record_index)
+
+    grouped = {}
+    for record_index, record in enumerate(fill_records):
+        grouped.setdefault(find(record_index), []).append(record)
+
+    boxes = []
+    for group in grouped.values():
+        xs = [x for _index, line in group for x in (line["x1"], line["x2"])]
+        ys = [y for _index, line in group for y in (line["y1"], line["y2"])]
+        box = {
+            "x0": min(xs), "y0": min(ys),
+            "x1": max(xs), "y1": max(ys),
+            "line_indexes": [index for index, _line in group],
+        }
+        if (
+            box["x1"] - box["x0"] >= MIN_SYMBOL_W
+            and box["y1"] - box["y0"] >= MIN_SYMBOL_H
+        ):
+            boxes.append(box)
+
+    for rectangle in page_data.get("rectangles", []):
+        if rectangle.get("fill") == ALTIUM_BODY_FILL:
+            box = {
+                "x0": min(rectangle["x0"], rectangle["x1"]),
+                "y0": min(rectangle["y0"], rectangle["y1"]),
+                "x1": max(rectangle["x0"], rectangle["x1"]),
+                "y1": max(rectangle["y0"], rectangle["y1"]),
+                "line_indexes": [],
+            }
+            if (
+                box["x1"] - box["x0"] >= MIN_SYMBOL_W
+                and box["y1"] - box["y0"] >= MIN_SYMBOL_H
+            ):
+                boxes.append(box)
+    return boxes
+
+
+def _rect_matches_box(rectangle: dict, box: dict, tolerance: float) -> bool:
+    return (
+        abs(min(rectangle["x0"], rectangle["x1"]) - box["x0"]) <= tolerance
+        and abs(min(rectangle["y0"], rectangle["y1"]) - box["y0"]) <= tolerance
+        and abs(max(rectangle["x0"], rectangle["x1"]) - box["x1"]) <= tolerance
+        and abs(max(rectangle["y0"], rectangle["y1"]) - box["y1"]) <= tolerance
+    )
+
+
+ALTIUM_SNAP_MM = 0.05
+
+
+def _snap(value: float) -> float:
+    return round(round(value / ALTIUM_SNAP_MM) * ALTIUM_SNAP_MM, 3)
+
+
+def normalize_altium_page(page_data: dict) -> None:
+    """Recolor Altium drawing conventions into the OrCAD decode language.
+
+    Every recolored primitive keeps its original color in "source_color" so
+    residual graphics can still be emitted faithfully.  Stroke coordinates
+    are snapped to a 0.05 mm grid: llPDFLib emits sub-hundredth float noise
+    that would otherwise separate a pin end from its wire after rounding.
+    """
+    lines = page_data["lines"]
+    curves = page_data["curves"]
+    rectangles = page_data["rectangles"]
+    texts = page_data["texts"]
+
+    for line in lines:
+        for key in ("x1", "y1", "x2", "y2"):
+            line[key] = _snap(line[key])
+    for rectangle in rectangles:
+        for key in ("x0", "y0", "x1", "y1"):
+            rectangle[key] = _snap(rectangle[key])
+
+    body_boxes = _altium_body_boxes(page_data)
+    page_data["altium_body_boxes"] = body_boxes
+    for box in body_boxes:
+        for index in box["line_indexes"]:
+            line = lines[index]
+            _remember_color(line)
+            line["color"] = BODY_COLOR
+            if not line.get("width"):
+                line["width"] = 0.254
+
+    for rectangle in rectangles:
+        if rectangle.get("fill") == ALTIUM_BODY_FILL:
+            _remember_color(rectangle)
+            rectangle["color"] = BODY_COLOR
+        elif rectangle.get("color") == ALTIUM_ACCENT_COLOR or (
+            rectangle.get("color") in ALTIUM_DNP_DRAW_COLORS
+        ):
+            _remember_color(rectangle)
+            rectangle["color"] = BODY_COLOR
+        elif rectangle.get("color") == "#000000" and any(
+            _rect_matches_box(rectangle, box, 0.6) for box in body_boxes
+        ):
+            _remember_color(rectangle)
+            rectangle["color"] = BODY_COLOR
+
+    for line in lines:
+        color = line.get("color")
+        width = float(line.get("width") or 0.0)
+        length = _line_length(line)
+        axis_aligned = (
+            abs(line["y2"] - line["y1"]) <= 0.08
+            or abs(line["x2"] - line["x1"]) <= 0.08
+        )
+        if color == ALTIUM_WIRE_COLOR and _is_solid(line) and width >= 0.1:
+            _remember_color(line)
+            line["color"] = WIRE_COLOR
+        elif color == ALTIUM_GRAPHIC_COLOR:
+            _remember_color(line)
+            line["color"] = BODY_COLOR
+        elif (
+            color == PIN_NUMBER_COLOR
+            and _is_solid(line)
+            and 0.15 <= width <= 0.4
+            and 1.0 <= length <= 8.2
+        ):
+            # Altium pins are axis-aligned; a sloped stroke (a switch lever,
+            # a diode arm) is symbol body art that anchors the cluster.
+            _remember_color(line)
+            line["color"] = PIN_COLOR if axis_aligned else BODY_COLOR
+        elif (
+            color in ALTIUM_DNP_DRAW_COLORS
+            and _is_solid(line)
+            and 0.15 <= width <= 0.4
+        ):
+            # A not-fitted part is drawn entirely in gray: recover its pin
+            # stubs and body graphics so the symbol survives with dnp set.
+            _remember_color(line)
+            line["color"] = (
+                PIN_COLOR
+                if axis_aligned and 2.0 <= length <= 8.2
+                else BODY_COLOR
+            )
+        elif (
+            color == ALTIUM_DIMMED_ACCENT_COLOR
+            and _is_solid(line)
+            and 0.15 <= width <= 0.4
+        ):
+            _remember_color(line)
+            line["color"] = ALTIUM_ACCENT_COLOR
+        elif (
+            color == ALTIUM_NOERC_COLOR
+            and _is_solid(line)
+            and width < 0.1
+            and 2.2 <= length <= 3.4
+            and min(
+                abs(line["x2"] - line["x1"]),
+                abs(line["y2"] - line["y1"]),
+            ) >= 1.2
+        ):
+            _remember_color(line)
+            line["color"] = NO_CONNECT_COLOR
+
+    for curve in curves:
+        color = curve.get("color")
+        if color == ALTIUM_GRAPHIC_COLOR or color in ALTIUM_DNP_DRAW_COLORS:
+            _remember_color(curve)
+            curve["color"] = BODY_COLOR
+        elif color == ALTIUM_DIMMED_ACCENT_COLOR:
+            _remember_color(curve)
+            curve["color"] = ALTIUM_ACCENT_COLOR
+        elif (
+            color in ALTIUM_JUNCTION_FILLS
+            and curve.get("fill") == color
+        ):
+            bbox = _curve_bbox(curve)
+            if max(bbox["x1"] - bbox["x0"], bbox["y1"] - bbox["y0"]) <= 1.2:
+                _remember_color(curve)
+                _remember_color(curve, "fill")
+                curve["color"] = "#ff0000"
+                curve["fill"] = "#ff0000"
+
+    titleblock = _altium_titleblock_bbox(page_data)
+    for text in texts:
+        color = text.get("color")
+        font = text.get("font", "")
+        cx = (text["x"] + text["x1"]) / 2
+        cy = (text["y"] + text["y1"]) / 2
+        in_titleblock = (
+            titleblock["x0"] <= cx <= titleblock["x1"]
+            and titleblock["y0"] <= cy <= titleblock["y1"]
+        )
+        if (
+            color == ALTIUM_TEXT_COLOR
+            and font.startswith("Times")
+            and not in_titleblock
+        ):
+            _remember_color(text)
+            text["color"] = "#000000"
+        elif (
+            color in ALTIUM_DNP_DRAW_COLORS
+            and font.startswith("Times")
+            and not in_titleblock
+        ):
+            _remember_color(text)
+            text["color"] = "#000000"
+            text["dnp"] = True
+        elif (
+            color in ALTIUM_DNP_DRAW_COLORS
+            and font.startswith("Courier")
+        ):
+            _remember_color(text)
+            text["color"] = "#000000"
+        elif color == ALTIUM_DIMMED_ACCENT_COLOR:
+            _remember_color(text)
+            text["color"] = ALTIUM_ACCENT_COLOR
+        elif (
+            color == "#000000"
+            and font.startswith("Courier")
+            and any(
+                box["x0"] - GEOM_TOL <= cx <= box["x1"] + GEOM_TOL
+                and box["y0"] - GEOM_TOL <= cy <= box["y1"] + GEOM_TOL
+                for box in body_boxes
+            )
+        ):
+            _remember_color(text)
+            text["color"] = PIN_NAME_COLOR
+
+
+def _altium_field_value(
+    label: dict,
+    texts: list[dict],
+    *,
+    numeric: bool = False,
+    max_dx: float = 60.0,
+    max_dy: float = 12.0,
+) -> str | None:
+    """The navy value text following an Altium title-block label."""
+    candidates = []
+    for text in texts:
+        if text.get("color") != ALTIUM_TEXT_COLOR:
+            continue
+        value = text.get("text", "").strip()
+        if not value or (numeric and not value.isdigit()):
+            continue
+        dx = text["x"] - label["x"]
+        dy = text["y"] - label["y"]
+        if -2.0 <= dx <= max_dx and -2.0 <= dy <= max_dy:
+            candidates.append((abs(dy) * 3.0 + max(dx, 0.0), value))
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
+def decode_worksheet_altium(page_data: dict) -> dict | None:
+    """Title-block fields from the Altium sheet template texts.
+
+    Unlike the OrCAD worksheet decoder this consumes nothing: the sheet
+    template remains residual graphics, only the fields are harvested.
+    """
+    texts = page_data.get("texts", [])
+    labels = {}
+    for text in texts:
+        value = text.get("text", "").strip()
+        if value in ("Title:", "Number:", "Date:", "Rev:", "Page", "of"):
+            labels.setdefault(value, text)
+    fields = {}
+    mapping = (
+        ("Title:", "title", False),
+        ("Number:", "document_number", False),
+        ("Date:", "date", False),
+        ("Rev:", "revision", False),
+    )
+    for label_name, field_name, numeric in mapping:
+        label = labels.get(label_name)
+        if label is None:
+            continue
+        value = _altium_field_value(label, texts, numeric=numeric)
+        if value:
+            fields[field_name] = value
+    if labels.get("Page"):
+        sheet = _altium_field_value(
+            labels["Page"], texts, numeric=True, max_dx=20.0, max_dy=4.0
+        )
+        if sheet:
+            fields["sheet"] = sheet
+    if labels.get("of"):
+        count = _altium_field_value(
+            labels["of"], texts, numeric=True, max_dx=20.0, max_dy=4.0
+        )
+        if count:
+            fields["sheet_count"] = count
+    if fields.get("title"):
+        fields["page_name"] = fields["title"]
+    if not fields:
+        return None
+    return {"fields": fields}
+
+
 def decode_page(page_data: dict) -> dict:
     """Infer schematic objects from OrCAD PDF drawing primitives."""
     components = []
     for bbox in _find_body_rectangles(page_data["lines"], page_data["rectangles"]):
-        ref = _nearest_reference(bbox, page_data["texts"])
+        ref = _nearest_reference(bbox, page_data["texts"], page_data.get("flavor"))
         pins = _pins_for_body(
             bbox,
             page_data["lines"],
             page_data["texts"],
             ref,
             page_data["curves"],
+            page_data.get("flavor"),
         )
         promoted_pin_names = _promote_numeric_pin_names(pins)
         components.append({
@@ -1702,8 +2096,14 @@ def decode_page(page_data: dict) -> dict:
         c["bbox"]["x0"],
     ))
     wires = _decode_wires(page_data["lines"])
-    global_labels = decode_global_labels(page_data)
-    worksheet = decode_worksheet(page_data)
+    if page_data.get("flavor") == "altium":
+        # Altium net identifiers are plain texts, not chevron glyphs; the
+        # sheet template also differs.  pdf2kicad decodes the labels.
+        global_labels = []
+        worksheet = decode_worksheet_altium(page_data)
+    else:
+        global_labels = decode_global_labels(page_data)
+        worksheet = decode_worksheet(page_data)
     return {
         "components": components,
         "wires": wires,
@@ -1736,6 +2136,8 @@ def extract_drawings(page, raw: bool):
         color = _color_hex(d.get('color'))
         fill = _color_hex(d.get('fill'))
         width = d.get('width') or 0
+        dashes = d.get('dashes')
+        dashed = bool(dashes) and dashes != "[] 0"
 
         for item in d.get('items', []):
             kind = item[0]
@@ -1750,6 +2152,8 @@ def extract_drawings(page, raw: bool):
                     "x1": conv(x1), "y1": conv(y1),
                     "x2": conv(x2), "y2": conv(y2),
                     "color": color,
+                    **({"fill": fill} if fill else {}),
+                    **({"dashed": True} if dashed else {}),
                     "width": round(width * PT_TO_MM, 3) if not raw else round(width, 3),
                 })
 
@@ -1803,6 +2207,10 @@ def extract_texts(page, raw: bool):
                 txt = span['text'].strip()
                 if not txt:
                     continue
+                if span.get('alpha', 255) == 0:
+                    # Fully transparent spans are invisible marker text
+                    # (Altium emits per-component "CO<ref>" markers).
+                    continue
                 bbox = span.get('bbox', [0, 0, 0, 0])
                 angle = _span_angle({'dir': line_dir})
                 texts.append({
@@ -1822,7 +2230,7 @@ def extract_texts(page, raw: bool):
     return texts
 
 
-def dump_page(page, raw: bool, decode: bool = False) -> dict:
+def dump_page(page, raw: bool, decode: bool = False, flavor: str | None = None) -> dict:
     """Extract all vector elements from a single page."""
     lines, curves, rectangles = extract_drawings(page, raw)
     texts = extract_texts(page, raw)
@@ -1838,6 +2246,10 @@ def dump_page(page, raw: bool, decode: bool = False) -> dict:
         "rectangles": rectangles,
         "texts": texts,
     }
+    if flavor and flavor != "orcad":
+        result["flavor"] = flavor
+    if flavor == "altium" and not raw:
+        normalize_altium_page(result)
     if decode:
         result["decoded"] = decode_page(result)
     return result
@@ -1856,11 +2268,17 @@ def main():
                         help="Compact JSON output (no indentation)")
     parser.add_argument("--decode", action="store_true",
                         help="Infer symbol bodies, pins, wires, and global labels")
+    parser.add_argument("--flavor", choices=["auto", "orcad", "altium"],
+                        default="auto",
+                        help="Source EDA tool; auto reads the PDF metadata")
     args = parser.parse_args()
     if args.decode and args.raw:
         parser.error("--decode uses millimeter heuristics; omit --raw")
 
     doc = fitz.open(args.pdf)
+    flavor = (
+        detect_flavor(doc.metadata) if args.flavor == "auto" else args.flavor
+    )
 
     if args.page is not None:
         if args.page < 1 or args.page > len(doc):
@@ -1873,13 +2291,19 @@ def main():
             "total_pages": len(doc),
             "units": "pt" if args.raw else "mm",
             "pages": [
-                {"page": args.page, **dump_page(page, args.raw, args.decode)},
+                {
+                    "page": args.page,
+                    **dump_page(page, args.raw, args.decode, flavor),
+                },
             ],
         }
     else:
         pages = []
         for i in range(len(doc)):
-            pages.append({"page": i + 1, **dump_page(doc[i], args.raw, args.decode)})
+            pages.append({
+                "page": i + 1,
+                **dump_page(doc[i], args.raw, args.decode, flavor),
+            })
         result = {
             "file": args.pdf,
             "total_pages": len(doc),

@@ -66,9 +66,11 @@ PIN_LENGTH = 2.54
 PIN_TEXT_SIZE = 1.27
 DNP_SUFFIX_RE = re.compile(r"\s*\*DNP\s*$", re.IGNORECASE)
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
+# Altium net and rail names may begin with a digit ("1.1V_LPDDR4", "3.3V").
+ALTIUM_NET_NAME_RE = re.compile(r"^[A-Za-z0-9_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
-MULTI_UNIT_REF_RE = re.compile(r"^(U\d+)([A-Z])$")
+MULTI_UNIT_REF_RE = re.compile(r"^([A-Z]{1,4}\d+)([A-Z])$")
 MERGED_PASSIVE_PREFIX_RE = re.compile(r"^(FB|R|C|L)(\d.*)$", re.IGNORECASE)
 PAPER_SCALES = {
     # Capture's standard "fit to A4" print factors.  A3 is reduced to 70%,
@@ -363,6 +365,39 @@ def _split_merged_reference_values(page: dict) -> None:
             or REF_RE.fullmatch(original)
         ):
             continue
+        if page.get("flavor") == "altium":
+            # llPDFLib merges horizontally adjacent spans: a designator with
+            # its value ("R117 0R") or two designators ("TP14TP15").
+            parts = None
+            space_match = re.fullmatch(r"(\S+)\s+(\S.*)", original)
+            if space_match and REF_RE.fullmatch(space_match.group(1)):
+                parts = space_match.groups()
+            else:
+                pair_match = re.fullmatch(
+                    r"(TP\d+[A-Z]?)(TP\d+[A-Z]?)", original
+                )
+                if pair_match:
+                    parts = pair_match.groups()
+            if parts:
+                first, second = parts
+                first_text = {**text, "text": first}
+                second_text = {**text, "text": second}
+                split_fraction = len(first) / len(original)
+                if int(round(text.get("angle", 0))) % 180 == 0:
+                    split = (
+                        text["x"] + (text["x1"] - text["x"]) * split_fraction
+                    )
+                    first_text["x1"] = split
+                    second_text["x"] = split
+                else:
+                    split = (
+                        text["y"] + (text["y1"] - text["y"]) * split_fraction
+                    )
+                    first_text["y1"] = split
+                    second_text["y"] = split
+                texts[index] = first_text
+                additions.append(second_text)
+                continue
         testpoint_match = re.fullmatch(
             r"(TP\d+[A-Z]?)(TP_PAD)",
             original,
@@ -480,9 +515,26 @@ class UuidFactory:
         return str(uuid.uuid5(self.namespace, f"{kind}:{self.index}"))
 
 
+def _paper_for_page_size(page: dict) -> str:
+    """The standard paper whose landscape size best matches the PDF page."""
+    width = page.get("width") or 0.0
+    height = page.get("height") or 0.0
+    return min(
+        PAPER_SIZES,
+        key=lambda paper: (
+            abs(PAPER_SIZES[paper][0] - width)
+            + abs(PAPER_SIZES[paper][1] - height)
+        ),
+    )
+
+
 def detect_paper(pages: list[dict], requested: str) -> str:
     if requested != "auto":
         return requested
+    if pages and all(page.get("flavor") == "altium" for page in pages):
+        # Altium PDFs are printed 1:1; the sheet size stated in the title
+        # block does not describe an additional print reduction.
+        return _paper_for_page_size(pages[0])
     candidates = []
     for page in pages:
         worksheet = (page.get("decoded") or {}).get("worksheet")
@@ -620,6 +672,7 @@ def detect_sheet_names(pages: list[dict]) -> list[str]:
             page_number == 1
             and not decoded.get("wires")
             and not decoded.get("components")
+            and not (page.get("flavor") == "altium" and page_name)
         ):
             base = "NOTE"
         elif page_name:
@@ -995,7 +1048,9 @@ def _recover_visible_pin_numbers(
 
     candidates = [
         text
-        for text in pdf_dump._pin_number_candidates(page["texts"])
+        for text in pdf_dump._pin_number_candidates(
+            page["texts"], page.get("flavor")
+        )
         if _text_key(text) not in consumed_texts
     ]
     scores = []
@@ -1196,7 +1251,7 @@ def _repair_mismatched_references(page: dict, components: list[dict]) -> None:
         if (
             component.get("reference_text")
             and _reference_matches_pin_count(
-                component.get("reference", ""),
+                (component.get("reference") or ""),
                 len(component.get("pins", [])),
             )
         )
@@ -1204,7 +1259,7 @@ def _repair_mismatched_references(page: dict, components: list[dict]) -> None:
     for component in components:
         pin_count = len(component.get("pins", []))
         if _reference_matches_pin_count(
-            component.get("reference", ""),
+            (component.get("reference") or ""),
             pin_count,
         ):
             continue
@@ -1281,7 +1336,7 @@ def _augment_component_geometry(page: dict, component: dict) -> None:
     }
     reference_match = re.match(
         r"([A-Za-z]+)",
-        component.get("reference", ""),
+        component.get("reference") or "",
     )
     reference_prefix = (
         reference_match.group(1).upper() if reference_match else ""
@@ -1406,7 +1461,7 @@ def _recover_connector_pin_labels(
 ) -> set[tuple]:
     """Recover black pin-name text used by connector library symbols."""
     if (
-        not re.match(r"^CN\d", component.get("reference", ""))
+        not re.match(r"^CN\d", (component.get("reference") or ""))
         or len(component.get("pins", [])) <= 2
         or any(pin.get("name") for pin in component["pins"])
     ):
@@ -1458,7 +1513,7 @@ def _recover_connector_pin_labels(
 
 def _suppress_numeric_j_pin_names(component: dict) -> None:
     """Discard PDF pin-number spans misclassified as J pin names."""
-    if not re.fullmatch(r"J\d+[A-Z]?", component.get("reference", "")):
+    if not re.fullmatch(r"J\d+[A-Z]?", (component.get("reference") or "")):
         return
     names = [
         str(pin["name"]).strip()
@@ -1636,8 +1691,7 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
     reference_texts = [
         text
         for text in page["texts"]
-        if text.get("color") == "#000000"
-        and REF_RE.match(text.get("text", "").strip())
+        if pdf_dump.is_reference_text(text, page.get("flavor"))
         and _text_key(text) not in used_texts
         and _text_key(text) not in {
             _text_key(component["reference_text"])
@@ -1812,6 +1866,10 @@ def decode_components(page: dict) -> tuple[list[dict], set[tuple], set[int]]:
             used_texts.add(_text_key(text))
 
     known = [component for component in known if component.get("reference")]
+    for component in known:
+        reference_text = component.get("reference_text") or {}
+        if reference_text.get("dnp"):
+            component["dnp"] = True
     known.sort(
         key=lambda component: (
             component["reference"],
@@ -1970,7 +2028,7 @@ def _configure_standard_testpoint(component: dict) -> None:
     if (
         not re.fullmatch(
             r"TP\d+[A-Z]?",
-            component.get("reference", ""),
+            (component.get("reference") or ""),
             re.IGNORECASE,
         )
         or len(component.get("pins", [])) != 1
@@ -1996,7 +2054,7 @@ def _enrich_component(
     """Normalize value metadata and enable requested passive enrichment."""
     value = str(component.get("value") or "")
     dnp_match = DNP_SUFFIX_RE.search(value)
-    component["dnp"] = bool(dnp_match)
+    component["dnp"] = bool(dnp_match) or bool(component.get("dnp"))
     if dnp_match:
         component["value"] = value[:dnp_match.start()].rstrip()
     component["_transform"] = transform
@@ -2053,6 +2111,13 @@ def assign_values(
                 or text.get("color") != "#000000"
                 or REF_RE.match(value)
             ):
+                continue
+            if (
+                page.get("flavor") == "altium"
+                and not text.get("font", "").startswith("Times")
+            ):
+                # Altium parameter texts are Times New Roman; Arial and
+                # Courier hits are sheet annotations and pin texts.
                 continue
             value_angle = int(round(text.get("angle", 0))) % 180
             same_angle = value_angle == reference_angle
@@ -2827,8 +2892,9 @@ def decode_no_connects(
                     (first[0] + second[0]) / 2,
                     (first[1] + second[1]) / 2,
                 )
+                # Capture draws four short X arms; Altium two full diagonals.
                 if (
-                    not 0.5 <= length <= 1.5
+                    not 0.5 <= length <= 3.4
                     or min(abs(dx), abs(dy)) < 0.25
                     or _distance(center, hot) > 0.15
                 ):
@@ -2909,7 +2975,226 @@ def decode_local_labels(
     return labels
 
 
+def decode_power_ports_altium(
+    page: dict,
+    wires: list[dict],
+    components: list[dict],
+    consumed_texts: set[tuple],
+    consumed_lines: set[int],
+    consumed_curves: set[int],
+) -> list[dict]:
+    """Recover Altium power ports: a maroon glyph beside a maroon net name.
+
+    Style 2 (GND bar) and style 6 (earth) are line-only glyphs; style 0
+    rails carry a small circle.  The stub endpoint on a wire or pin is the
+    electrical hotpoint.
+    """
+    if not wires and not components:
+        return []
+    accent = pdf_dump.ALTIUM_ACCENT_COLOR
+    records = []
+    for index, line in enumerate(page["lines"]):
+        if (
+            index in consumed_lines
+            or line.get("color") != accent
+            or line.get("dashed")
+            or pdf_dump._line_length(line) < GEOM_TOL
+        ):
+            continue
+        records.append(("line", index, line, _bbox_for_lines([line])))
+    for index, curve in enumerate(page.get("curves", [])):
+        if index in consumed_curves or curve.get("color") != accent:
+            continue
+        records.append(("curve", index, curve, _curve_bbox(curve)))
+    if not records:
+        return []
+
+    parent = list(range(len(records)))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(first, second):
+        first, second = find(first), find(second)
+        if first != second:
+            parent[second] = first
+
+    for first in range(len(records)):
+        for second in range(first + 1, len(records)):
+            if _bboxes_touch(records[first][3], records[second][3], 0.3):
+                union(first, second)
+    groups: dict[int, list[int]] = {}
+    for item in range(len(records)):
+        groups.setdefault(find(item), []).append(item)
+
+    pin_hots = [
+        (pin["hot"]["x"], pin["hot"]["y"])
+        for component in components
+        for pin in component.get("pins", [])
+    ]
+    ports = []
+    seen = set()
+    for group in groups.values():
+        bbox = _bbox_union(*(records[item][3] for item in group))
+        glyph_points = [
+            point
+            for item in group
+            if records[item][0] == "line"
+            for point in (
+                _point(records[item][2], 1),
+                _point(records[item][2], 2),
+            )
+        ]
+        if not glyph_points:
+            continue
+        hot = None
+        hits = []
+        for point in glyph_points:
+            wire_hit = _point_on_any_wire(point, wires, 0.3)
+            if wire_hit:
+                hits.append((wire_hit[0], wire_hit[1]))
+        if hits:
+            hot = min(hits)[1]
+        else:
+            pin_hits = [
+                (_distance(point, pin), pin)
+                for point in glyph_points
+                for pin in pin_hots
+                if _distance(point, pin) <= 0.3
+            ]
+            if pin_hits:
+                hot = min(pin_hits)[1]
+        if hot is None:
+            continue
+        names = []
+        for text in page["texts"]:
+            value = text.get("text", "").strip()
+            if (
+                text.get("color") != accent
+                or _text_key(text) in consumed_texts
+                or not ALTIUM_NET_NAME_RE.match(value)
+            ):
+                continue
+            distance = _bbox_distance(bbox, _text_bbox(text))
+            if distance <= 4.0:
+                names.append((distance, text))
+        if not names:
+            continue
+        _score, text = min(names, key=lambda entry: entry[0])
+        name = text["text"].strip()
+        key = (name, round(hot[0], 2), round(hot[1], 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        glyph = (
+            "supply"
+            if any(records[item][0] == "curve" for item in group)
+            else "ground"
+        )
+        center = (
+            (bbox["x0"] + bbox["x1"]) / 2,
+            (bbox["y0"] + bbox["y1"]) / 2,
+        )
+        away = (center[0] - hot[0], center[1] - hot[1])
+        if abs(away[0]) >= abs(away[1]):
+            direction = "right" if away[0] > 0 else "left"
+        else:
+            direction = "down" if away[1] > 0 else "up"
+        angle_map = (
+            {"down": 0, "right": 90, "up": 180, "left": 270}
+            if glyph == "ground"
+            else {"up": 0, "left": 90, "down": 180, "right": 270}
+        )
+        line_indexes = sorted(
+            records[item][1] for item in group if records[item][0] == "line"
+        )
+        ports.append({
+            "name": name,
+            "point": hot,
+            "kind": "power",
+            "glyph": glyph,
+            "angle": angle_map[direction],
+            "text": text,
+            "line_indexes": line_indexes,
+        })
+        consumed_texts.add(_text_key(text))
+        consumed_lines.update(line_indexes)
+        consumed_curves.update(
+            records[item][1] for item in group if records[item][0] == "curve"
+        )
+    ports.sort(key=lambda port: (port["point"][1], port["point"][0]))
+    return ports
+
+
+def decode_net_labels_altium(
+    page: dict, wires: list[dict], consumed_texts: set[tuple]
+) -> list[dict]:
+    """Altium net labels: maroon texts anchored on a wire, globally scoped."""
+    labels = []
+    seen = set()
+    accent = pdf_dump.ALTIUM_ACCENT_COLOR
+    for text in page["texts"]:
+        key = _text_key(text)
+        value = text.get("text", "").strip()
+        if (
+            key in consumed_texts
+            or text.get("color") != accent
+            or not ALTIUM_NET_NAME_RE.match(value)
+            or len(value) > 100
+        ):
+            continue
+        bbox = _text_bbox(text)
+        size = max(float(text.get("size") or 0), 0.1)
+        max_distance = max(0.8, size * 0.6)
+        probe_points = [
+            (bbox["x0"], bbox["y0"]),
+            (bbox["x0"], bbox["y1"]),
+            (bbox["x1"], bbox["y0"]),
+            (bbox["x1"], bbox["y1"]),
+            ((bbox["x0"] + bbox["x1"]) / 2, bbox["y0"]),
+            ((bbox["x0"] + bbox["x1"]) / 2, bbox["y1"]),
+            (bbox["x0"], (bbox["y0"] + bbox["y1"]) / 2),
+            (bbox["x1"], (bbox["y0"] + bbox["y1"]) / 2),
+        ]
+        hit = _nearest_wire_point(probe_points, wires, max_distance)
+        if not hit:
+            continue
+        point = hit[1]
+        label_key = (value, round(point[0], 2), round(point[1], 2))
+        if label_key in seen:
+            consumed_texts.add(key)
+            continue
+        center = (
+            (bbox["x0"] + bbox["x1"]) / 2,
+            (bbox["y0"] + bbox["y1"]) / 2,
+        )
+        if int(round(text.get("angle", 0))) % 180 == 0:
+            direction = "right" if point[0] <= center[0] else "left"
+        else:
+            direction = "down" if point[1] <= center[1] else "up"
+        labels.append({
+            "name": value,
+            "point": point,
+            "kind": "global",
+            "angle": {
+                "right": 0,
+                "left": 180,
+                "up": 90,
+                "down": 270,
+            }[direction],
+            "direction": direction,
+        })
+        consumed_texts.add(key)
+        seen.add(label_key)
+    labels.sort(key=lambda label: (label["point"][1], label["point"][0]))
+    return labels
+
+
 def decode_page(page: dict) -> dict:
+    flavor = page.get("flavor")
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
     buses = decode_buses(page)
     wires, bus_entries = decode_bus_entries(decoded["wires"], buses)
@@ -2930,22 +3215,38 @@ def decode_page(page: dict) -> dict:
         components,
         semantic_lines,
     )
-    power_ports = decode_power_ports(
-        page,
-        wires,
-        consumed_texts,
-        semantic_lines,
-    )
+    if flavor == "altium":
+        power_ports = decode_power_ports_altium(
+            page,
+            wires,
+            components,
+            consumed_texts,
+            semantic_lines,
+            semantic_curves,
+        )
+    else:
+        power_ports = decode_power_ports(
+            page,
+            wires,
+            consumed_texts,
+            semantic_lines,
+        )
     assign_values(page, components, consumed_texts)
-    global_labels = decode_global_labels(
-        page,
-        wires,
-        buses,
-        components,
-        consumed_texts,
-        semantic_lines,
-    )
-    local_labels = decode_local_labels(page, wires, consumed_texts)
+    if flavor == "altium":
+        # Flat net-identifier scope: every Altium net label merges by name
+        # across all pages, which is exactly a KiCad global label.
+        global_labels = decode_net_labels_altium(page, wires, consumed_texts)
+        local_labels = []
+    else:
+        global_labels = decode_global_labels(
+            page,
+            wires,
+            buses,
+            components,
+            consumed_texts,
+            semantic_lines,
+        )
+        local_labels = decode_local_labels(page, wires, consumed_texts)
     worksheet = decoded.get("worksheet")
     if worksheet:
         semantic_lines.update(worksheet.get("line_indexes", []))
@@ -2993,7 +3294,10 @@ def detect_multi_units(semantics: list[dict]) -> dict[str, list[dict]]:
                 candidates.setdefault(base, {}).setdefault(suffix, []).append(
                     component
                 )
-            elif re.fullmatch(r"U\d+", reference):
+            elif re.fullmatch(r"[A-Z]{1,4}\d+", reference) and component.get(
+                "pins"
+            ):
+                # A pinless text-only match is too weak to veto unit merging.
                 bare_references.add(reference)
 
     groups = {}
@@ -3039,6 +3343,39 @@ def detect_multi_units(semantics: list[dict]) -> dict[str, list[dict]]:
                 component["footprint"] = next(iter(shared_footprints))
         groups[base] = members
     return groups
+
+
+def rename_duplicate_references(
+    semantics: list[dict], multi_unit_groups: dict[str, list[dict]]
+) -> dict[str, int]:
+    """Give repeated designators on different pages unique suffixes.
+
+    A PDF of a multi-channel or alternate-assembly design can print the same
+    logical designator on several pages; KiCad would fold those symbols into
+    one component and corrupt the netlist.  Members of a detected multi-unit
+    group intentionally share their reference and are left alone.
+    """
+    multi_unit_members = {
+        id(component)
+        for members in multi_unit_groups.values()
+        for component in members
+    }
+    seen: dict[str, int] = {}
+    renamed: dict[str, int] = {}
+    for semantic in semantics:
+        for component in semantic["components"]:
+            if id(component) in multi_unit_members:
+                continue
+            reference = component.get("reference")
+            if not reference:
+                continue
+            occurrence = seen.get(reference, 0) + 1
+            seen[reference] = occurrence
+            if occurrence > 1:
+                component["source_reference"] = reference
+                component["reference"] = f"{reference}_{occurrence}"
+                renamed[reference] = renamed.get(reference, 1) + 1
+    return renamed
 
 
 def _rgba(color: str | None, alpha=1) -> str:
@@ -3568,7 +3905,7 @@ def _pin_relocations(
             old_hot = (pin["hot"]["x"], pin["hot"]["y"])
             old_key = _pin_point_key(old_hot)
             original_pin_keys.append(old_key)
-            pin_owners.append((old_key, component.get("reference", "")))
+            pin_owners.append((old_key, (component.get("reference") or "")))
             new_hot, _length = _pin_for_output(
                 component_transform,
                 component,
@@ -3582,7 +3919,7 @@ def _pin_relocations(
                         {"old": old_hot, "moves": []},
                     )
                     record["moves"].append({
-                        "reference": component.get("reference", ""),
+                        "reference": (component.get("reference") or ""),
                         "new": new_hot,
                     })
                 continue
@@ -4065,6 +4402,13 @@ def _component_instance(
     return "".join(parts)
 
 
+def _source_color(primitive: dict) -> str | None:
+    """The authored color of a primitive the decoder may have recolored."""
+    if "source_color" in primitive:
+        return primitive["source_color"]
+    return primitive.get("color")
+
+
 def _graphic_line(factory, transform, line) -> str:
     x1, y1 = transform.xy(line["x1"], line["y1"])
     x2, y2 = transform.xy(line["x2"], line["y2"])
@@ -4073,7 +4417,7 @@ def _graphic_line(factory, transform, line) -> str:
         "\t(polyline\n"
         f"\t\t(pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))\n"
         f"\t\t(stroke (width {width:.2f}) (type default) "
-        f"(color {_rgba(line.get('color'))}))\n"
+        f"(color {_rgba(_source_color(line))}))\n"
         f'\t\t(uuid "{factory.new("graphic-line")}")\n'
         "\t)\n"
     )
@@ -4094,7 +4438,7 @@ def _graphic_rectangle(factory, transform, rectangle) -> str:
         f"\t\t(start {x0:.2f} {y0:.2f})\n"
         f"\t\t(end {x1:.2f} {y1:.2f})\n"
         f"\t\t(stroke (width {width:.2f}) (type default) "
-        f"(color {_rgba(rectangle.get('color'))}))\n"
+        f"(color {_rgba(_source_color(rectangle))}))\n"
         f"\t\t{fill_part}\n"
         f'\t\t(uuid "{factory.new("graphic-rectangle")}")\n'
         "\t)\n"
@@ -4111,7 +4455,7 @@ def _graphic_curve(factory, transform, curve) -> str:
         "\t(polyline\n"
         f"\t\t(pts {points})\n"
         f"\t\t(stroke (width {width:.2f}) (type default) "
-        f"(color {_rgba(curve.get('color'))}))\n"
+        f"(color {_rgba(_source_color(curve))}))\n"
         f'\t\t(uuid "{factory.new("graphic-curve")}")\n'
         "\t)\n"
     )
@@ -4150,7 +4494,7 @@ def _graphic_text(factory, transform, text) -> str:
         f"\t\t(at {x:.2f} {y:.2f} {angle})\n"
         f'\t\t(effects (font (face "{ORCAD_TEXT_FACE}") '
         f"(size {size:.2f} {size:.2f}){style_part} "
-        f"(color {_rgba(text.get('color'))})) (justify left bottom))\n"
+        f"(color {_rgba(_source_color(text))})) (justify left bottom))\n"
         f'\t\t(uuid "{factory.new("graphic-text")}")\n'
         "\t)\n"
     )
@@ -4324,6 +4668,9 @@ def render_page(
                 or index in semantic["semantic_lines"]
             ):
                 continue
+            if "source_color" in line and line["source_color"] is None:
+                # A recolored fill boundary had no visible stroke of its own.
+                continue
             parts.append(_graphic_line(factory, transform, line))
         for index, rectangle in enumerate(page["rectangles"]):
             if index not in semantic["semantic_rectangles"]:
@@ -4487,15 +4834,20 @@ def convert_pdf(
     keep_graphics: bool = True,
     infer_footprints: bool = False,
     use_kicad_rcl: bool = False,
+    flavor: str = "auto",
 ) -> tuple[dict[str, str], dict]:
     pdf_bytes = pdf_path.read_bytes()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if flavor == "auto":
+        flavor = pdf_dump.detect_flavor(doc.metadata)
     pages = []
     for index in range(len(doc)):
         pages.append(
             {
                 "page": index + 1,
-                **pdf_dump.dump_page(doc[index], raw=False, decode=True),
+                **pdf_dump.dump_page(
+                    doc[index], raw=False, decode=True, flavor=flavor
+                ),
             }
         )
     factory = UuidFactory(pdf_bytes)
@@ -4532,6 +4884,13 @@ def convert_pdf(
     multi_unit_groups = detect_multi_units(
         [record["semantic"] for record in page_records]
     )
+    if flavor == "altium":
+        # Multi-channel designs print the same logical designator on several
+        # pages; keep the flat KiCad project annotation-unique.
+        rename_duplicate_references(
+            [record["semantic"] for record in page_records],
+            multi_unit_groups,
+        )
     source_has_worksheet = has_source_worksheet(page_records)
     root_uuid = factory.new("schematic")
     sheet_uuids = [
@@ -4627,6 +4986,7 @@ def convert_pdf(
     paper_summary = papers[0] if len(set(papers)) == 1 else "mixed"
     return output, {
         "project": project_name,
+        "flavor": flavor,
         "paper": paper_summary,
         "multi_units": {
             reference: len(members)
@@ -4673,6 +5033,12 @@ def main() -> None:
         action="store_true",
         help="Print the conversion summary as JSON",
     )
+    parser.add_argument(
+        "--flavor",
+        choices=["auto", "orcad", "altium"],
+        default="auto",
+        help="Source EDA tool; auto reads the PDF metadata (default: auto)",
+    )
     args = parser.parse_args()
 
     if not args.pdf.is_file():
@@ -4685,6 +5051,7 @@ def main() -> None:
         keep_graphics=not args.no_graphics,
         infer_footprints=args.infer_footprints,
         use_kicad_rcl=args.kicad_rcl,
+        flavor=args.flavor,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in output.items():

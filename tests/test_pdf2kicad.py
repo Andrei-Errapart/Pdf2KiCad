@@ -14,6 +14,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import pdf2kicad  # noqa: E402
+import pdf_dump  # noqa: E402
 
 
 def line(color, x1, y1, x2, y2):
@@ -3489,6 +3490,448 @@ class TextRenderingTests(unittest.TestCase):
         self.assertEqual(rendered.count('(face "Arial")'), 2)
         self.assertEqual(rendered.count("(size 1.64 1.64)"), 2)
         self.assertEqual(rendered.count("(bold yes)"), 1)
+
+
+def altium_text(value, x, y, x1, y1, color, font="Times New Roman",
+                size=2.28, angle=0):
+    return {
+        "text": value,
+        "x": x,
+        "y": y,
+        "x1": x1,
+        "y1": y1,
+        "size": size,
+        "angle": angle,
+        "color": color,
+        "font": font,
+    }
+
+
+def altium_line(color, x1, y1, x2, y2, width=0.254, **extra):
+    return {
+        "color": color,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "width": width,
+        **extra,
+    }
+
+
+def altium_page(**overrides):
+    page = {
+        "width": 297.0,
+        "height": 210.0,
+        "flavor": "altium",
+        "lines": [],
+        "curves": [],
+        "rectangles": [],
+        "texts": [],
+    }
+    page.update(overrides)
+    return page
+
+
+def junction_dot_curves(x, y, radius=0.25, color="#4b4b94"):
+    return [
+        {
+            "color": color,
+            "fill": color,
+            "points": points,
+            "width": 0.0,
+        }
+        for points in (
+            [[x - radius, y], [x - radius / 2, y - radius / 2], [x, y - radius]],
+            [[x, y - radius], [x + radius / 2, y - radius / 2], [x + radius, y]],
+            [[x + radius, y], [x + radius / 2, y + radius / 2], [x, y + radius]],
+            [[x, y + radius], [x - radius / 2, y + radius / 2], [x - radius, y]],
+        )
+    ]
+
+
+class AltiumFlavorTests(unittest.TestCase):
+    def test_flavor_detected_from_creator(self):
+        self.assertEqual(
+            pdf_dump.detect_flavor({"creator": "Altium Designer",
+                                    "producer": "llPDFLib 3.x"}),
+            "altium",
+        )
+
+    def test_orcad_and_unknown_metadata_default_to_orcad(self):
+        self.assertEqual(
+            pdf_dump.detect_flavor({"creator": "OrCAD Capture"}), "orcad"
+        )
+        self.assertEqual(pdf_dump.detect_flavor(None), "orcad")
+
+    def test_altium_paper_follows_pdf_page_size(self):
+        page = altium_page(
+            width=297.039,
+            height=209.903,
+            texts=[altium_text("A2", 280.0, 190.0, 284.0, 192.3, "#000000")],
+        )
+        self.assertEqual(pdf2kicad.detect_paper([page], "auto"), "A4")
+
+
+class AltiumNormalizationTests(unittest.TestCase):
+    def test_wire_pin_and_graphic_recoloring(self):
+        page = altium_page(lines=[
+            altium_line("#000080", 10.0, 10.0, 20.0, 10.0),
+            altium_line("#0000ff", 30.0, 10.0, 32.0, 12.0),
+            altium_line("#000000", 40.0, 10.0, 45.1, 10.0),
+            altium_line("#000000", 50.0, 10.0, 53.0, 13.0),
+            altium_line("#000000", 60.0, 10.0, 90.0, 10.0, width=0.042),
+        ])
+        pdf_dump.normalize_altium_page(page)
+        wire, graphic, pin, lever, frame = page["lines"]
+        self.assertEqual(wire["color"], pdf_dump.WIRE_COLOR)
+        self.assertEqual(wire["source_color"], "#000080")
+        self.assertEqual(graphic["color"], pdf_dump.BODY_COLOR)
+        self.assertEqual(pin["color"], pdf_dump.PIN_COLOR)
+        # A sloped black stroke is body art, not a pin.
+        self.assertEqual(lever["color"], pdf_dump.BODY_COLOR)
+        # Thin template strokes stay black.
+        self.assertEqual(frame["color"], "#000000")
+
+    def test_body_fill_quad_becomes_body_and_boxes(self):
+        quad = [
+            altium_line(None, 100.0, 100.0, 110.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 100.0, 110.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 110.0, 100.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 100.0, 110.0, 100.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+        ]
+        page = altium_page(lines=quad)
+        pdf_dump.normalize_altium_page(page)
+        self.assertTrue(
+            all(l["color"] == pdf_dump.BODY_COLOR for l in page["lines"])
+        )
+        boxes = page["altium_body_boxes"]
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(
+            (boxes[0]["x0"], boxes[0]["y0"], boxes[0]["x1"], boxes[0]["y1"]),
+            (100.0, 100.0, 110.0, 110.0),
+        )
+
+    def test_junction_dot_and_no_erc_cross_recolor(self):
+        page = altium_page(
+            lines=[
+                altium_line("#ff0000", 114.06, 103.98, 116.1, 106.02,
+                            width=0.042),
+                # A red decoration dash is far too short for a no-ERC arm.
+                altium_line("#ff0000", 10.0, 10.0, 10.79, 10.0, width=0.042),
+            ],
+            curves=junction_dot_curves(85.0, 105.0),
+        )
+        pdf_dump.normalize_altium_page(page)
+        self.assertEqual(page["lines"][0]["color"], pdf_dump.NO_CONNECT_COLOR)
+        self.assertEqual(page["lines"][1]["color"], "#ff0000")
+        for curve in page["curves"]:
+            self.assertEqual(curve["color"], "#ff0000")
+            self.assertEqual(curve["fill"], "#ff0000")
+
+    def test_text_recoloring_rules(self):
+        body_quad = [
+            altium_line(None, 100.0, 100.0, 110.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 100.0, 110.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 110.0, 100.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 100.0, 110.0, 100.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+        ]
+        designator = altium_text("U7", 102.0, 96.0, 105.0, 98.3, "#000080")
+        arial_navy = altium_text("13", 250.0, 100.0, 252.0, 102.3, "#000080",
+                                 font="Arial")
+        titleblock_value = altium_text("P001", 250.0, 195.0, 254.0, 197.3,
+                                       "#000080")
+        dnp_ref = altium_text("R210", 30.0, 30.0, 34.0, 32.3, "#bfbfbf")
+        pin_name = altium_text("EN", 101.0, 104.0, 103.0, 106.0, "#000000",
+                               font="Courier")
+        net_label = altium_text("1V8", 50.0, 50.0, 53.0, 52.3, "#800000")
+        page = altium_page(
+            lines=body_quad,
+            texts=[designator, arial_navy, titleblock_value, dnp_ref,
+                   pin_name, net_label],
+        )
+        pdf_dump.normalize_altium_page(page)
+        self.assertEqual(designator["color"], "#000000")
+        self.assertEqual(designator["source_color"], "#000080")
+        self.assertEqual(arial_navy["color"], "#000080")
+        self.assertEqual(titleblock_value["color"], "#000080")
+        self.assertEqual(dnp_ref["color"], "#000000")
+        self.assertTrue(dnp_ref["dnp"])
+        self.assertEqual(pin_name["color"], pdf_dump.PIN_NAME_COLOR)
+        self.assertEqual(net_label["color"], "#800000")
+
+    def test_coordinates_snap_to_grid(self):
+        page = altium_page(lines=[
+            altium_line("#000080", 10.003, 15.98, 20.001, 15.985),
+        ])
+        pdf_dump.normalize_altium_page(page)
+        line = page["lines"][0]
+        self.assertEqual(
+            (line["x1"], line["y1"], line["x2"], line["y2"]),
+            (10.0, 16.0, 20.0, 16.0),
+        )
+
+    def test_reference_text_filter(self):
+        times = altium_text("R117", 10.0, 10.0, 14.0, 12.3, "#000000")
+        courier = altium_text("H65", 10.0, 10.0, 14.0, 12.3, "#000000",
+                              font="Courier")
+        arial = altium_text("J1", 10.0, 10.0, 12.0, 12.3, "#000000",
+                            font="Arial")
+        dielectric = altium_text("X7R", 10.0, 10.0, 14.0, 12.3, "#000000")
+        self.assertTrue(pdf_dump.is_reference_text(times, "altium"))
+        self.assertFalse(pdf_dump.is_reference_text(courier, "altium"))
+        self.assertFalse(pdf_dump.is_reference_text(arial, "altium"))
+        self.assertFalse(pdf_dump.is_reference_text(dielectric, "altium"))
+        # The OrCAD flavor keeps its Arial-based behavior.
+        self.assertTrue(pdf_dump.is_reference_text(arial, None))
+
+    def test_pin_number_candidates_skip_recolored_texts(self):
+        ball = altium_text("A4", 10.0, 10.0, 12.0, 12.3, "#000000",
+                           font="Arial")
+        recolored = {
+            **altium_text("R210", 20.0, 10.0, 24.0, 12.3, "#000000"),
+            "source_color": "#bfbfbf",
+        }
+        candidates = pdf_dump._pin_number_candidates(
+            [ball, recolored], "altium"
+        )
+        self.assertEqual([text["text"] for text in candidates], ["A4"])
+
+
+class AltiumMergedSpanTests(unittest.TestCase):
+    def test_reference_value_span_splits_on_space(self):
+        page = altium_page(texts=[
+            altium_text("R117 0R", 10.0, 10.0, 20.0, 12.3, "#000000"),
+        ])
+        pdf2kicad._split_merged_reference_values(page)
+        values = [text["text"] for text in page["texts"]]
+        self.assertEqual(values, ["R117", "0R"])
+        self.assertLess(page["texts"][0]["x1"], 20.0)
+        self.assertEqual(page["texts"][1]["x1"], 20.0)
+
+    def test_adjacent_testpoint_designators_split(self):
+        page = altium_page(texts=[
+            altium_text("TP14TP15", 10.0, 10.0, 20.0, 12.3, "#000000"),
+        ])
+        pdf2kicad._split_merged_reference_values(page)
+        self.assertEqual(
+            [text["text"] for text in page["texts"]], ["TP14", "TP15"]
+        )
+
+class AltiumNetLabelTests(unittest.TestCase):
+    def test_digit_initial_label_becomes_global(self):
+        wires = [{"start": {"x": 45.0, "y": 99.0},
+                  "end": {"x": 70.0, "y": 99.0}}]
+        page = altium_page(texts=[
+            altium_text("1V8_RAIL", 50.0, 96.5, 58.0, 98.8, "#800000"),
+        ])
+        consumed = set()
+        labels = pdf2kicad.decode_net_labels_altium(page, wires, consumed)
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0]["name"], "1V8_RAIL")
+        self.assertEqual(labels[0]["kind"], "global")
+        self.assertEqual(labels[0]["point"][1], 99.0)
+        self.assertEqual(len(consumed), 1)
+
+    def test_label_off_wire_is_ignored(self):
+        wires = [{"start": {"x": 45.0, "y": 99.0},
+                  "end": {"x": 70.0, "y": 99.0}}]
+        page = altium_page(texts=[
+            altium_text("FLOATING", 50.0, 80.0, 58.0, 82.3, "#800000"),
+        ])
+        labels = pdf2kicad.decode_net_labels_altium(page, wires, set())
+        self.assertEqual(labels, [])
+
+
+class AltiumPowerPortTests(unittest.TestCase):
+    def test_ground_bar_glyph(self):
+        wires = [{"start": {"x": 90.0, "y": 102.46},
+                  "end": {"x": 100.0, "y": 102.46}}]
+        page = altium_page(
+            lines=[
+                altium_line("#800000", 98.73, 105.0, 101.27, 105.0),
+                altium_line("#800000", 100.0, 102.46, 100.0, 105.0),
+            ],
+            texts=[
+                altium_text("GND", 98.5, 105.5, 102.0, 107.8, "#800000"),
+            ],
+        )
+        consumed_texts, consumed_lines, consumed_curves = set(), set(), set()
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, wires, [], consumed_texts, consumed_lines, consumed_curves
+        )
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(ports[0]["name"], "GND")
+        self.assertEqual(ports[0]["glyph"], "ground")
+        self.assertEqual(ports[0]["point"], (100.0, 102.46))
+        self.assertEqual(ports[0]["angle"], 0)
+        self.assertEqual(consumed_lines, {0, 1})
+
+    def test_supply_circle_glyph_with_digit_name(self):
+        wires = [{"start": {"x": 90.0, "y": 103.0},
+                  "end": {"x": 100.0, "y": 103.0}}]
+        page = altium_page(
+            lines=[
+                altium_line("#800000", 100.0, 103.0, 100.0, 104.2),
+            ],
+            curves=[{
+                "color": "#800000",
+                "points": [[99.6, 104.6], [100.0, 104.2], [100.4, 104.6],
+                           [100.0, 105.0], [99.6, 104.6]],
+                "width": 0.254,
+            }],
+            texts=[
+                altium_text("3.3V", 98.5, 105.2, 102.0, 107.5, "#800000"),
+            ],
+        )
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, wires, [], set(), set(), set()
+        )
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(ports[0]["name"], "3.3V")
+        self.assertEqual(ports[0]["glyph"], "supply")
+
+
+class AltiumWorksheetTests(unittest.TestCase):
+    def test_title_block_fields(self):
+        page = altium_page(texts=[
+            altium_text("Title:", 220.0, 188.0, 226.0, 190.3, "#000000",
+                        font="Arial"),
+            altium_text("PMOD", 222.0, 191.0, 230.0, 194.2, "#000080",
+                        font="Arial", size=3.17),
+            altium_text("Page", 240.0, 199.0, 245.0, 201.3, "#000000",
+                        font="Arial"),
+            altium_text("13", 246.0, 199.0, 248.0, 201.3, "#000080",
+                        font="Arial"),
+            altium_text("of", 249.0, 199.0, 251.0, 201.3, "#000000",
+                        font="Arial"),
+            altium_text("50", 252.0, 199.0, 254.0, 201.3, "#000080",
+                        font="Arial"),
+        ])
+        worksheet = pdf_dump.decode_worksheet_altium(page)
+        fields = worksheet["fields"]
+        self.assertEqual(fields["title"], "PMOD")
+        self.assertEqual(fields["page_name"], "PMOD")
+        self.assertEqual(fields["sheet"], "13")
+        self.assertEqual(fields["sheet_count"], "50")
+
+
+class AltiumDuplicateReferenceTests(unittest.TestCase):
+    def test_cross_page_duplicates_are_suffixed(self):
+        first = {"components": [{"reference": "R13"}]}
+        second = {"components": [{"reference": "R13"},
+                                 {"reference": "C7"}]}
+        renamed = pdf2kicad.rename_duplicate_references(
+            [first, second], {}
+        )
+        self.assertEqual(second["components"][0]["reference"], "R13_2")
+        self.assertEqual(
+            second["components"][0]["source_reference"], "R13"
+        )
+        self.assertEqual(first["components"][0]["reference"], "R13")
+        self.assertEqual(renamed, {"R13": 2})
+
+    def test_multi_unit_members_keep_shared_reference(self):
+        unit_a = {"reference": "U1", "unit": 1}
+        unit_b = {"reference": "U1", "unit": 2}
+        semantics = [{"components": [unit_a]}, {"components": [unit_b]}]
+        pdf2kicad.rename_duplicate_references(
+            semantics, {"U1": [unit_a, unit_b]}
+        )
+        self.assertEqual(unit_a["reference"], "U1")
+        self.assertEqual(unit_b["reference"], "U1")
+
+
+class AltiumPageDecodeTests(unittest.TestCase):
+    @staticmethod
+    def _page():
+        body_fill = [
+            altium_line(None, 100.0, 100.0, 110.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 100.0, 110.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 110.0, 110.0, 100.0, 110.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+            altium_line(None, 100.0, 110.0, 100.0, 100.0, width=0.0,
+                        fill=pdf_dump.ALTIUM_BODY_FILL),
+        ]
+        return altium_page(
+            lines=body_fill + [
+                # pins
+                altium_line("#000000", 94.9, 105.0, 100.0, 105.0),
+                altium_line("#000000", 110.0, 105.0, 115.1, 105.0),
+                # wire and two branches meeting at a junction
+                altium_line("#000080", 85.0, 105.0, 94.9, 105.0),
+                altium_line("#000080", 85.0, 95.0, 85.0, 105.0),
+                altium_line("#000080", 78.0, 105.0, 85.0, 105.0),
+                # no-ERC cross on the right pin
+                altium_line("#ff0000", 114.08, 103.98, 116.12, 106.02,
+                            width=0.042),
+                altium_line("#ff0000", 114.08, 106.02, 116.12, 103.98,
+                            width=0.042),
+            ],
+            curves=junction_dot_curves(85.0, 105.0),
+            rectangles=[{
+                "x0": 100.0, "y0": 100.0, "x1": 110.0, "y1": 110.0,
+                "color": "#800000", "fill": None, "width": 0.254,
+            }],
+            texts=[
+                altium_text("U7", 102.0, 96.0, 105.0, 98.3, "#000080"),
+                altium_text("LDO", 102.0, 111.0, 106.0, 113.3, "#000080"),
+                altium_text("1", 97.5, 103.2, 98.5, 104.5, "#000000",
+                            font="Arial", size=1.3),
+                altium_text("2", 111.5, 103.2, 112.5, 104.5, "#000000",
+                            font="Arial", size=1.3),
+                altium_text("EN1", 86.0, 102.5, 89.0, 104.8, "#800000"),
+            ],
+        )
+
+    def test_full_page_decode(self):
+        page = self._page()
+        pdf_dump.normalize_altium_page(page)
+        page["decoded"] = pdf_dump.decode_page(page)
+        semantic = pdf2kicad.decode_page(page)
+
+        components = semantic["components"]
+        self.assertEqual(len(components), 1)
+        component = components[0]
+        self.assertEqual(component["reference"], "U7")
+        self.assertEqual(component["value"], "LDO")
+        self.assertEqual(
+            sorted(pin.get("number") for pin in component["pins"]),
+            ["1", "2"],
+        )
+
+        self.assertEqual(len(semantic["wires"]), 3)
+        self.assertEqual(semantic["junctions"], [(85.0, 105.0)])
+        self.assertEqual(semantic["no_connects"], [(115.1, 105.0)])
+        self.assertEqual(semantic["local_labels"], [])
+        self.assertEqual(len(semantic["global_labels"]), 1)
+        self.assertEqual(semantic["global_labels"][0]["name"], "EN1")
+
+    def test_render_page_emits_global_label(self):
+        page = self._page()
+        pdf_dump.normalize_altium_page(page)
+        page["decoded"] = pdf_dump.decode_page(page)
+        semantic = pdf2kicad.decode_page(page)
+        rendered = pdf2kicad.render_page(
+            pdf2kicad.UuidFactory(b"altium-test"),
+            page,
+            semantic,
+            pdf2kicad.coordinate_transform("A4"),
+            "Altium test page",
+            keep_graphics=True,
+        )
+        self.assertIn('(global_label "EN1"', rendered)
+        self.assertIn('(property "Reference" "U7"', rendered)
 
 
 if __name__ == "__main__":
