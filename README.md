@@ -1,10 +1,10 @@
 # pdf2kicad
 
 `pdf2kicad` reconstructs an editable KiCad schematic project from an
-OrCAD/Capture-generated PDF. It builds on `scripts/pdf_dump.py` and recovers
-the PDF's colored schematic geometry as KiCad wires and buses, native
-junctions, generic symbols and pins, local/global labels, power ports, and
-sequential multi-unit designators.
+OrCAD/Capture- or Altium Designer-generated PDF. It builds on
+`scripts/pdf_dump.py` and recovers the PDF's colored schematic geometry as
+KiCad wires and buses, native junctions, generic symbols and pins,
+local/global labels, power ports, and sequential multi-unit designators.
 
 PDF is a presentation format, not a schematic database. Library identities,
 hidden fields, multi-unit relationships, electrical pin types, and some pin
@@ -19,10 +19,11 @@ source title, company, date, revision, document number, page name, and source
 page count are parsed when present and transferred to that title block.
 
 Multi-unit components are inferred project-wide when designators with one
-`U<number>` prefix have an uninterrupted suffix sequence beginning with `A`,
-for example `U1A`, `U1B`, and `U1C`. They are emitted as units 1, 2, and 3 of
-the shared KiCad reference `U1`. Gapped, duplicated, or otherwise ambiguous
-sequences remain separate components.
+letter-prefixed base (`U1`, `D3`, `J1`, ...) have an uninterrupted suffix
+sequence beginning with `A`, for example `U1A`, `U1B`, and `U1C`. They are
+emitted as units 1, 2, and 3 of the shared KiCad reference `U1`. Gapped,
+duplicated, or otherwise ambiguous sequences remain separate components; a
+bare same-base component with pins also vetoes the merge.
 
 OrCAD off-page ports become native KiCad global labels. Their connector
 direction controls the KiCad orientation so the label body extends away from
@@ -43,6 +44,26 @@ associated with those bodies, and connector pin labels that resemble
 designators remain pins rather than becoming bodyless components. Segmented
 round outlines used by ground points and testpoints are absorbed into their
 symbols instead of being emitted as standalone graphics.
+
+## Altium Designer PDFs
+
+Altium PDFs (llPDFLib producer) use a different drawing language, detected
+automatically from the PDF metadata or forced with `--flavor altium`.
+Normalization maps the Altium conventions onto the OrCAD decode pipeline:
+navy wires, black axis-aligned pin strokes, pale-yellow body fills, blue
+symbol art, blue-gray junction dots, red no-ERC crosses, and maroon net
+labels and power-port glyphs (bar, circle, and earth styles). Fully
+transparent marker text is dropped, coalesced designator/value spans are
+split, and coordinates are snapped to a 0.05 mm grid to absorb the
+generator's float noise. Because such projects use flat net-identifier
+scope, every net label becomes a KiCad global label. Titles, page numbers,
+and sheet names are read from the sheet-template title block; the template
+itself stays residual graphics. Not-fitted variant parts print dimmed gray
+and are recovered with KiCad's native do-not-populate state. Multi-channel
+designs can print one logical designator on several pages; duplicates are
+suffixed (`R13_2`) to keep the flat project annotation-unique. Buses, bus
+entries, and Altium ports (none appear in the validation design) are not yet
+recovered; per-object color overrides fall back to residual graphics.
 
 Values ending in `*DNP` are cleaned and emitted with KiCad's native
 do-not-populate state and BOM exclusion. Optional passive enrichment can infer
@@ -67,6 +88,8 @@ Useful options:
 
 ```text
 --paper auto|A0|A1|A2|A3|A4  select the source Capture sheet size
+--flavor auto|orcad|altium     select the authoring EDA tool (auto reads the
+                               PDF metadata)
 --no-graphics                  omit the residual PDF vector/text trace
 --infer-footprints             infer SMD footprints for two-terminal passives
 --kicad-rcl                    use standard KiCad Device R/C/L/ferrite symbols
