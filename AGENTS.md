@@ -12,6 +12,19 @@ installation. Unit tests are consolidated in `tests/test_pdf2kicad.py`. Keep
 generated `.kicad_sch`, `.kicad_pro`, and `.kicad_wks` files in a separate
 output directory, not alongside source files, and do not commit them.
 
+`web/` is the browser-only converter, published to GitHub Pages by
+`.github/workflows/pages.yml`. It runs the two Python scripts unmodified
+under Pyodide; there is no second implementation. Its modules are plain ES
+modules with no build step: `app.js` (DOM wiring), `session.js` (which
+request is current, cancellation), `worker.js`, `input.js` (PDF or ZIP to
+PDF bytes), `runner.js` (Pyodide and the converter), `summary.js`,
+`preview.js`, and `archive.js`. Only `app.js` and the rendering halves of
+`summary.js` and `preview.js` touch the DOM. `web/vendor/` holds committed
+third-party code, recorded in `web/vendor/README.md`. `web/runtime/` and
+`web/py/` are build products of `scripts/build-web` and are not committed.
+JavaScript tests and their fixtures live in `tests/web/`, outside the served
+directory. The design is `doc/specs/2026-10-03-web-converter-design.md`.
+
 ## Build, Test, and Development Commands
 
 - `python3 -m unittest discover -s tests -v` runs the complete self-contained
@@ -28,6 +41,17 @@ output directory, not alongside source files, and do not commit them.
   which is useful when diagnosing recovery failures.
 - `python3 -m py_compile scripts/pdf2kicad.py scripts/pdf_dump.py` performs a
   quick syntax check.
+- `scripts/build-web` downloads the pinned Pyodide and PyMuPDF wheel into
+  `web/runtime/` and copies the Python sources into `web/py/`. Run it again
+  after changing anything under `scripts/`, or the parity test reports the
+  copy as stale.
+- `node --test tests/web/*.test.mjs` runs the web converter's JavaScript
+  tests. Those that need `web/runtime/`, and `tests/test_web_parity.py` in
+  the Python suite, are skipped until `scripts/build-web` has run;
+  `PDF2KICAD_REQUIRE_WEB=1` turns the skip into a failure, as in CI.
+- `python3 -m http.server -d web 8000` serves the page locally.
+- `python3 tests/web/make_fixtures.py` regenerates the committed web test
+  fixtures; it needs PyMuPDF.
 - `kicad-cli sch export netlist output_dir/project.kicad_sch` exports a netlist
   for corpus-level connectivity comparison.
 
@@ -43,6 +67,22 @@ helpers should begin with `_`. Preserve the GPL-2.0-or-later SPDX header in
 source files. No formatter or linter is configured, so match nearby code and
 keep changes focused.
 
+The Python sources must keep running on Python 3.13, the version Pyodide
+provides in the browser, even though development may use a newer one; CI
+runs the suite on 3.13. Report input the converter cannot handle by raising
+`ConversionError` with a message written for the user: the CLI prints it and
+exits with status 1, and the web page shows it as is.
+
+JavaScript under `web/` uses four-space indentation, double quotes, and ES
+modules, with no framework, bundler, or npm dependency. Keep modules that
+can run without a DOM free of DOM access so that Node can test them, and
+never add a request to another origin: the page's Content-Security-Policy
+forbids it and the privacy statement depends on it. The files under
+`web/vendor/` are third-party code; change them only from upstream, and keep
+`web/vendor/README.md` in sync, as with `scripts/kicad_symbols/`. The
+Pyodide and PyMuPDF versions are pinned, with hashes, in `scripts/build-web`
+alone, and move together.
+
 The files under `scripts/kicad_symbols/` are third-party data, not project
 source: do not hand-edit them or add SPDX headers to them. Take any change from
 upstream KiCad and keep `scripts/kicad_symbols/NOTICE` — which records the
@@ -57,7 +97,12 @@ Add a focused regression fixture for every recovery bug, using small in-memory
 page, component, line, or text dictionaries when possible. Assert both the
 recovered semantic object and consumption of source graphics where relevant.
 Keep tests self-contained: no corpus PDFs, no network, no real KiCad
-installation. Run the full suite before submitting. Corpus validation
+installation. Tests that need a PDF draw one in memory with PyMuPDF. Web
+tests use `node:test`, one `tests/web/<module>.test.mjs` per module, with
+small synthetic fixtures written by `tests/web/make_fixtures.py`. Run both
+suites before submitting. A change to the page's behavior in a browser is
+additionally checked by hand against the checklist in the web converter
+spec. Corpus validation
 additionally uses the parent repository’s `tests/0001`, `tests/0002`, and
 `tests/0003` PDFs and DSN-derived reference connectivity.
 
