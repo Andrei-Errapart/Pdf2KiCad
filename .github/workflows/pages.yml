@@ -1,0 +1,89 @@
+# Copyright (C) 2026 Andrei Errapart
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Assemble the web converter's runtime, run the whole test suite -- including
+# the web/native parity test, which must not skip here -- and publish web/
+# to GitHub Pages.  Pull requests build and test without deploying.
+# See doc/specs/2026-10-03-web-converter-design.md, Deployment.
+
+name: Web converter
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The native PyMuPDF the tests compare against is the release whose
+  # WebAssembly wheel scripts/build-web pins; bump the two together.
+  PYMUPDF_VERSION: "1.28.0"
+  PDF2KICAD_REQUIRE_WEB: "1"
+  PDF2KICAD_WEB_CACHE: ${{ github.workspace }}/.web-cache
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # 3.13 is the Python the page runs (Pyodide 0.29), so a construct that
+      # needs a newer one fails here rather than on the site.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Cache the downloaded runtime
+        uses: actions/cache@v6
+        with:
+          path: .web-cache
+          key: web-runtime-${{ hashFiles('scripts/build-web') }}
+
+      - name: Install PyMuPDF
+        run: pip install "pymupdf==$PYMUPDF_VERSION"
+
+      - name: Assemble the web runtime
+        run: scripts/build-web
+
+      - name: Python tests, including web parity
+        run: python -m unittest discover -s tests -v
+
+      - name: JavaScript tests
+        run: node --test tests/web/*.test.mjs
+
+      - name: Stamp the build
+        run: |
+          printf '{"commit": "%s"}\n' "$GITHUB_SHA" > web/version.json
+
+      - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: web
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
