@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "Pdf2KiCad",
+  "project_id": "c8804cf5-33bb-499d-a3dd-107f480b834d"
+}
