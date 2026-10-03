@@ -1,0 +1,111 @@
+#!/bin/sh
+# Copyright (C) 2026 Andrei Errapart
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Assemble what the web converter needs beside its own files under web/:
+#
+#   web/runtime/   Pyodide and the PyMuPDF wheel built for it, downloaded at
+#                  the versions pinned below and checked against the hashes
+#                  recorded here
+#   web/py/        copies of the converter's Python sources and symbols
+#
+#   scripts/build-web
+#
+# Both directories are build products and are not committed.  Downloads are
+# kept in a cache outside the tree ($PDF2KICAD_WEB_CACHE to choose where) and
+# reused.  CI runs this same script, so the page is deployed with the runtime
+# the tests exercised.
+#
+# The two pins move together: the wheel's pyemscripten_2025_0 tag is the ABI
+# of Pyodide 0.28 and 0.29, and no other.
+set -eu
+
+PYODIDE_VERSION=0.29.5
+PYODIDE_URL="https://registry.npmjs.org/pyodide/-/pyodide-$PYODIDE_VERSION.tgz"
+PYODIDE_SHA256=6749b10ee515a1458ecea36d860c8ce2a48366e85b3f92d749ad1840e4aff181
+PYODIDE_FILES="pyodide.mjs pyodide.asm.js pyodide.asm.wasm python_stdlib.zip pyodide-lock.json"
+
+PYMUPDF_VERSION=1.28.0
+PYMUPDF_WHEEL="pymupdf-$PYMUPDF_VERSION-cp313-abi3-pyemscripten_2025_0_wasm32.whl"
+PYMUPDF_URL="https://files.pythonhosted.org/packages/72/f6/1e52ce243ca792254f6223b4017c5667194c146ce9b88baf37bc5eb3d1c9/$PYMUPDF_WHEEL"
+PYMUPDF_SHA256=74c6d00ba2a9aad3a635db73b07c15db462b480741d831a34a75a56535ebc22b
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_DIR=$(dirname -- "$SCRIPT_DIR")
+WEB_DIR="$REPO_DIR/web"
+
+if [ -n "${PDF2KICAD_WEB_CACHE:-}" ]; then
+    CACHE_DIR=$PDF2KICAD_WEB_CACHE
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    CACHE_DIR="$XDG_CACHE_HOME/pdf2kicad/web"
+elif [ -n "${HOME:-}" ] && [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]; then
+    CACHE_DIR="$HOME/Library/Caches/pdf2kicad/web"
+elif [ -n "${HOME:-}" ]; then
+    CACHE_DIR="$HOME/.cache/pdf2kicad/web"
+else
+    CACHE_DIR="${TMPDIR:-/tmp}/pdf2kicad-web-${USER:-user}"
+fi
+mkdir -p "$CACHE_DIR"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+# fetch URL SHA256 NAME: leave a verified copy at $CACHE_DIR/NAME.
+fetch() {
+    target="$CACHE_DIR/$3"
+    if [ -f "$target" ] && [ "$(sha256_of "$target")" = "$2" ]; then
+        return
+    fi
+    echo "build-web: downloading $3" >&2
+    curl -fsSL --retry 3 -o "$target.part" "$1"
+    actual=$(sha256_of "$target.part")
+    if [ "$actual" != "$2" ]; then
+        rm -f "$target.part"
+        echo "build-web: $3 has SHA-256 $actual, expected $2" >&2
+        exit 1
+    fi
+    mv "$target.part" "$target"
+}
+
+fetch "$PYODIDE_URL" "$PYODIDE_SHA256" "pyodide-$PYODIDE_VERSION.tgz"
+fetch "$PYMUPDF_URL" "$PYMUPDF_SHA256" "$PYMUPDF_WHEEL"
+
+rm -rf "$WEB_DIR/runtime" "$WEB_DIR/py"
+mkdir -p "$WEB_DIR/runtime/pyodide" "$WEB_DIR/py/kicad_symbols"
+
+unpacked="$CACHE_DIR/pyodide-$PYODIDE_VERSION"
+rm -rf "$unpacked"
+mkdir -p "$unpacked"
+tar xzf "$CACHE_DIR/pyodide-$PYODIDE_VERSION.tgz" -C "$unpacked"
+for name in $PYODIDE_FILES; do
+    cp "$unpacked/package/$name" "$WEB_DIR/runtime/pyodide/$name"
+done
+rm -rf "$unpacked"
+cp "$CACHE_DIR/$PYMUPDF_WHEEL" "$WEB_DIR/runtime/$PYMUPDF_WHEEL"
+
+# What web/runner.js loads; the pins live in this script only.
+cat > "$WEB_DIR/runtime/runtime.json" <<EOF
+{"pyodide": "$PYODIDE_VERSION", "pymupdf": "$PYMUPDF_VERSION", "wheel": "$PYMUPDF_WHEEL"}
+EOF
+
+cp "$SCRIPT_DIR/pdf2kicad.py" "$SCRIPT_DIR/pdf_dump.py" "$WEB_DIR/py/"
+cp "$SCRIPT_DIR"/kicad_symbols/*.kicad_sym "$WEB_DIR/py/kicad_symbols/"
+
+# The list web/runner.js copies into the interpreter's file system.
+(
+    cd "$WEB_DIR/py"
+    separator=
+    printf '['
+    for name in *.py kicad_symbols/*.kicad_sym; do
+        printf '%s"%s"' "$separator" "$name"
+        separator=', '
+    done
+    printf ']\n'
+) > "$WEB_DIR/py/files.json"
+
+echo "build-web: web/runtime (Pyodide $PYODIDE_VERSION, PyMuPDF $PYMUPDF_VERSION) and web/py are ready" >&2
