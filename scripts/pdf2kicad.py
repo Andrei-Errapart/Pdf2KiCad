@@ -29,6 +29,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 try:
     import fitz  # PyMuPDF
@@ -43,6 +44,11 @@ import pdf_dump
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# A page with more drawing objects than this is not decoded.  The densest
+# schematic page in the validation corpus has 5,321; PCB layout plots and
+# placement maps, which the decoder cannot finish in reasonable time, start
+# at 14,318.
+MAX_PAGE_DRAWINGS = 12000
 KICAD_VERSION = 20260306
 BODY_COLOR = pdf_dump.BODY_COLOR
 PIN_COLOR = pdf_dump.PIN_COLOR
@@ -257,23 +263,31 @@ def _point_to_segment(point, a, b) -> tuple[float, tuple[float, float]]:
 
 
 def _point_on_any_wire(point, wires: list[dict], tolerance=GEOM_TOL):
-    best = None
-    for wire in wires:
-        a = (wire["start"]["x"], wire["start"]["y"])
-        b = (wire["end"]["x"], wire["end"]["y"])
-        dist, nearest = _point_to_segment(point, a, b)
-        if dist <= tolerance and (best is None or dist < best[0]):
-            best = (dist, nearest, wire)
-    return best
+    return _nearest_wire_point([point], wires, tolerance)
 
 
 def _nearest_wire_point(points, wires: list[dict], max_distance: float):
     best = None
+    # A wire within max_distance of a point has that point inside its
+    # bounding box grown by max_distance; the rest are skipped unmeasured.
+    # The slack keeps a hit exactly at the limit from being lost to rounding.
+    margin = max_distance + 1e-9
     for point in points:
+        px, py = point[0], point[1]
         for wire in wires:
-            a = (wire["start"]["x"], wire["start"]["y"])
-            b = (wire["end"]["x"], wire["end"]["y"])
-            dist, nearest = _point_to_segment(point, a, b)
+            start, end = wire["start"], wire["end"]
+            ax, ay, bx, by = start["x"], start["y"], end["x"], end["y"]
+            if ax <= bx:
+                if px < ax - margin or px > bx + margin:
+                    continue
+            elif px < bx - margin or px > ax + margin:
+                continue
+            if ay <= by:
+                if py < ay - margin or py > by + margin:
+                    continue
+            elif py < by - margin or py > ay + margin:
+                continue
+            dist, nearest = _point_to_segment(point, (ax, ay), (bx, by))
             if dist <= max_distance and (best is None or dist < best[0]):
                 best = (dist, nearest, wire)
     return best
@@ -2084,6 +2098,7 @@ def assign_values(
     page: dict, components: list[dict], consumed_texts: set[tuple]
 ) -> None:
     wires = (page.get("decoded") or {}).get("wires", [])
+    labels_wire: dict[int, bool] = {}
     aligned_pair_scores = []
     body_pair_scores = []
     for component_index, component in enumerate(components):
@@ -2126,16 +2141,17 @@ def assign_values(
                 and reference_prefix not in ("R", "C", "L", "FB")
             ):
                 continue
-            if (
-                wires
-                and LABEL_RE.match(value)
-                and _nearest_wire_point(
-                    [_local_label_anchor(text)],
-                    wires,
-                    max(0.42, float(text.get("size") or 0.1) * 0.30),
-                )
-            ):
-                continue
+            if wires and LABEL_RE.match(value):
+                # Whether the text labels a wire does not depend on the
+                # component, so it is worked out once per text.
+                if text_index not in labels_wire:
+                    labels_wire[text_index] = bool(_nearest_wire_point(
+                        [_local_label_anchor(text)],
+                        wires,
+                        max(0.42, float(text.get("size") or 0.1) * 0.30),
+                    ))
+                if labels_wire[text_index]:
+                    continue
             if abs(float(text.get("size") or 0) - size) > size * 0.35:
                 continue
             text_bbox = _text_bbox(text)
@@ -4827,17 +4843,66 @@ def project_file(project_name: str, worksheet_name: str | None = None) -> str:
     ) + "\n"
 
 
-def convert_pdf(
-    pdf_path: Path,
+class ConversionError(Exception):
+    """The input cannot be converted; the message is meant for the user."""
+
+
+def _open_pdf(pdf_bytes: bytes, name: str):
+    """Open the PDF and return it with every page's drawing objects.
+
+    Refuses, before any decoding, input that is not a PDF, is locked, has
+    no vector content, or has a page too dense to be a schematic sheet.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as error:  # PyMuPDF raises several unrelated types
+        raise ConversionError(f'"{name}" is not a readable PDF.') from error
+    if doc.needs_pass:
+        raise ConversionError(
+            f'"{name}" is password-protected; remove the password and try again.'
+        )
+    page_drawings = []
+    for number, page in enumerate(doc, 1):
+        drawings = page.get_drawings()
+        if len(drawings) > MAX_PAGE_DRAWINGS:
+            raise ConversionError(
+                f'Page {number} of "{name}" has {len(drawings)} drawing '
+                f"objects; the limit is {MAX_PAGE_DRAWINGS}. It does not look "
+                "like a schematic sheet: PCB layout plots and placement maps "
+                "are not supported."
+            )
+        page_drawings.append(drawings)
+    if not any(page_drawings):
+        raise ConversionError(
+            f'"{name}" contains no vector drawings. Scanned or image-only '
+            "PDFs cannot be converted."
+        )
+    return doc, page_drawings
+
+
+def convert_pdf(pdf_path: Path, **options) -> tuple[dict[str, str], dict]:
+    """Convert the PDF at ``pdf_path``; see ``convert_pdf_bytes``."""
+    return convert_pdf_bytes(pdf_path.read_bytes(), pdf_path.name, **options)
+
+
+def convert_pdf_bytes(
+    pdf_bytes: bytes,
+    name: str,
     *,
     paper: str = "auto",
     keep_graphics: bool = True,
     infer_footprints: bool = False,
     use_kicad_rcl: bool = False,
     flavor: str = "auto",
+    progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, str], dict]:
-    pdf_bytes = pdf_path.read_bytes()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    """Convert a PDF held in memory into KiCad project files.
+
+    ``name`` is the PDF's file name, from which the project is named.
+    ``progress(page, pages)`` is called as the decoding of each page starts.
+    Returns the output files by name and the conversion summary.
+    """
+    doc, page_drawings = _open_pdf(pdf_bytes, name)
     if flavor == "auto":
         flavor = pdf_dump.detect_flavor(doc.metadata)
     pages = []
@@ -4846,12 +4911,16 @@ def convert_pdf(
             {
                 "page": index + 1,
                 **pdf_dump.dump_page(
-                    doc[index], raw=False, decode=True, flavor=flavor
+                    doc[index],
+                    raw=False,
+                    decode=True,
+                    flavor=flavor,
+                    drawings=page_drawings[index],
                 ),
             }
         )
     factory = UuidFactory(pdf_bytes)
-    project_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", pdf_path.stem).strip("_")
+    project_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(name).stem).strip("_")
     project_name = project_name or "pdf_schematic"
 
     output = {}
@@ -4863,6 +4932,8 @@ def convert_pdf(
     for index, page in enumerate(pages, 1):
         selected_paper = detect_paper([page], paper)
         transform = coordinate_transform(selected_paper)
+        if progress:
+            progress(index, len(pages))
         semantic = decode_page(page)
         for component in semantic["components"]:
             _enrich_component(
@@ -5045,14 +5116,18 @@ def main() -> None:
         parser.error(f"PDF not found: {args.pdf}")
     output_dir = args.output_dir or Path(f"{args.pdf.stem}_kicad")
     print(f"Opening {args.pdf.name}...", file=sys.stderr)
-    output, summary = convert_pdf(
-        args.pdf,
-        paper=args.paper,
-        keep_graphics=not args.no_graphics,
-        infer_footprints=args.infer_footprints,
-        use_kicad_rcl=args.kicad_rcl,
-        flavor=args.flavor,
-    )
+    try:
+        output, summary = convert_pdf(
+            args.pdf,
+            paper=args.paper,
+            keep_graphics=not args.no_graphics,
+            infer_footprints=args.infer_footprints,
+            use_kicad_rcl=args.kicad_rcl,
+            flavor=args.flavor,
+        )
+    except ConversionError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in output.items():
         (output_dir / filename).write_text(content, encoding="utf-8")

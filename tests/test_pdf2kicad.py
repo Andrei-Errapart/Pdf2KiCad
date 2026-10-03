@@ -3,11 +3,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import copy
+import io
 import json
+import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import fitz  # PyMuPDF
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -3932,6 +3937,269 @@ class AltiumPageDecodeTests(unittest.TestCase):
         )
         self.assertIn('(global_label "EN1"', rendered)
         self.assertIn('(property "Reference" "U7"', rendered)
+
+
+def wire(x1, y1, x2, y2):
+    return {"start": {"x": x1, "y": y1}, "end": {"x": x2, "y": y2}}
+
+
+def exhaustive_nearest_wire_point(points, wires, max_distance):
+    """The wire search with no prefilter: every point against every wire."""
+    best = None
+    for point in points:
+        for candidate in wires:
+            a = (candidate["start"]["x"], candidate["start"]["y"])
+            b = (candidate["end"]["x"], candidate["end"]["y"])
+            dist, nearest = pdf2kicad._point_to_segment(point, a, b)
+            if dist <= max_distance and (best is None or dist < best[0]):
+                best = (dist, nearest, candidate)
+    return best
+
+
+class WireProximityTests(unittest.TestCase):
+    def random_geometry(self, seed):
+        rng = random.Random(seed)
+        wires = []
+        for _ in range(60):
+            x, y = rng.uniform(0, 100), rng.uniform(0, 100)
+            kind = rng.randrange(4)
+            if kind == 0:
+                wires.append(wire(x, y, x + rng.uniform(-30, 30), y))
+            elif kind == 1:
+                wires.append(wire(x, y, x, y + rng.uniform(-30, 30)))
+            elif kind == 2:
+                wires.append(wire(
+                    x, y, x + rng.uniform(-9, 9), y + rng.uniform(-9, 9)
+                ))
+            else:
+                wires.append(wire(x, y, x, y))
+        points = [
+            (rng.uniform(-5, 105), rng.uniform(-5, 105)) for _ in range(80)
+        ]
+        return points, wires
+
+    def test_nearest_wire_point_matches_exhaustive_search(self):
+        for seed in range(5):
+            points, wires = self.random_geometry(seed)
+            for max_distance in (0.25, 2.0, 8.0):
+                for point in points:
+                    self.assertEqual(
+                        pdf2kicad._nearest_wire_point(
+                            [point], wires, max_distance
+                        ),
+                        exhaustive_nearest_wire_point(
+                            [point], wires, max_distance
+                        ),
+                    )
+                self.assertEqual(
+                    pdf2kicad._nearest_wire_point(points, wires, max_distance),
+                    exhaustive_nearest_wire_point(points, wires, max_distance),
+                )
+
+    def test_point_on_any_wire_matches_exhaustive_search(self):
+        for seed in range(5):
+            points, wires = self.random_geometry(seed)
+            for tolerance in (0.08, 0.3, 3.0):
+                for point in points:
+                    self.assertEqual(
+                        pdf2kicad._point_on_any_wire(point, wires, tolerance),
+                        exhaustive_nearest_wire_point(
+                            [point], wires, tolerance
+                        ),
+                    )
+
+    def test_wire_exactly_at_the_distance_limit_is_found(self):
+        horizontal = wire(10.0, 20.0, 30.0, 20.0)
+        for point in ((20.0, 22.0), (8.0, 20.0), (32.0, 20.0), (20.0, 18.0)):
+            hit = pdf2kicad._nearest_wire_point([point], [horizontal], 2.0)
+            self.assertIsNotNone(hit, point)
+            self.assertIs(hit[2], horizontal)
+
+    def test_distant_wires_are_not_measured(self):
+        near = wire(10.0, 10.0, 20.0, 10.0)
+        far = [wire(100.0 + i, 50.0, 100.0 + i, 90.0) for i in range(50)]
+        with mock.patch.object(
+            pdf2kicad, "_point_to_segment", wraps=pdf2kicad._point_to_segment
+        ) as measured:
+            hit = pdf2kicad._nearest_wire_point(
+                [(15.0, 10.2)], far + [near], 0.5
+            )
+            on_wire = pdf2kicad._point_on_any_wire(
+                (15.0, 10.1), far + [near], 0.16
+            )
+        self.assertIs(hit[2], near)
+        self.assertIs(on_wire[2], near)
+        self.assertEqual(measured.call_count, 2)
+
+
+class AssignValuesWireLabelTests(unittest.TestCase):
+    @staticmethod
+    def text(value, x0, y0, x1, y1):
+        return {
+            "text": value,
+            "color": "#000000",
+            "x": x0,
+            "y": y0,
+            "x1": x1,
+            "y1": y1,
+            "size": 1.0,
+            "angle": 0,
+        }
+
+    def test_wire_label_test_runs_once_per_text_not_per_component(self):
+        references = [
+            self.text(f"U{index}", 10.0 * index, 10.0, 10.0 * index + 2, 11.0)
+            for index in range(1, 5)
+        ]
+        net_label = self.text("NET_A", 60.0, 48.84, 64.0, 49.84)
+        value = self.text("LM358", 10.0, 11.5, 14.0, 12.5)
+        page = {
+            "lines": [],
+            "rectangles": [],
+            "curves": [],
+            "texts": references + [net_label, value],
+            "decoded": {"wires": [wire(55.0, 50.0, 80.0, 50.0)]},
+        }
+        components = [
+            {
+                "reference": reference["text"],
+                "reference_text": reference,
+                "bbox": {
+                    "x0": reference["x"], "y0": 12.0,
+                    "x1": reference["x"] + 5.0, "y1": 17.0,
+                },
+                "body_lines": [],
+                "pins": [],
+            }
+            for reference in references
+        ]
+        with mock.patch.object(
+            pdf2kicad,
+            "_nearest_wire_point",
+            wraps=pdf2kicad._nearest_wire_point,
+        ) as searched:
+            pdf2kicad.assign_values(page, components, set())
+
+        self.assertEqual(components[0]["value"], "LM358")
+        self.assertNotIn("NET_A", [c["value"] for c in components])
+        # NET_A and LM358 both look like labels; each is tested against the
+        # wires once, however many components there are.
+        self.assertEqual(searched.call_count, 2)
+
+
+def vector_pdf_bytes(pages=1):
+    """A small vector PDF: two strokes and one text span on every page."""
+    doc = fitz.open()
+    for index in range(pages):
+        page = doc.new_page(width=842, height=595)
+        page.draw_line((100, 100), (200, 100), color=(0, 0, 1), width=0.5)
+        page.draw_line((200, 100), (200, 180), color=(0, 0, 1), width=0.5)
+        page.insert_text((110, 90), f"NET{index}", fontsize=8)
+    return doc.tobytes()
+
+
+class ConvertBytesTests(unittest.TestCase):
+    def test_project_is_named_after_the_given_file_name(self):
+        files, summary = pdf2kicad.convert_pdf_bytes(
+            vector_pdf_bytes(), "My Board.pdf"
+        )
+        self.assertEqual(summary["project"], "My_Board")
+        self.assertIn("My_Board.kicad_pro", files)
+        self.assertIn("My_Board.kicad_sch", files)
+
+    def test_path_entry_point_gives_the_same_result(self):
+        pdf_bytes = vector_pdf_bytes(pages=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "demo.pdf"
+            path.write_bytes(pdf_bytes)
+            from_path = pdf2kicad.convert_pdf(path, use_kicad_rcl=True)
+        from_bytes = pdf2kicad.convert_pdf_bytes(
+            pdf_bytes, "demo.pdf", use_kicad_rcl=True
+        )
+        self.assertEqual(from_path, from_bytes)
+
+    def test_progress_is_reported_once_per_page_in_order(self):
+        calls = []
+        pdf2kicad.convert_pdf_bytes(
+            vector_pdf_bytes(pages=3),
+            "demo.pdf",
+            progress=lambda page, pages: calls.append((page, pages)),
+        )
+        self.assertEqual(calls, [(1, 3), (2, 3), (3, 3)])
+
+
+class ConversionGateTests(unittest.TestCase):
+    """Inputs the converter refuses before any decoding is attempted."""
+
+    def assert_refused(self, pdf_bytes, *fragments):
+        with mock.patch.object(
+            pdf_dump, "decode_page", side_effect=AssertionError("decoded")
+        ):
+            with self.assertRaises(pdf2kicad.ConversionError) as caught:
+                pdf2kicad.convert_pdf_bytes(pdf_bytes, "board.pdf")
+        for fragment in fragments:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_bytes_that_are_not_a_pdf_are_refused(self):
+        self.assert_refused(b"PK\x03\x04 not a pdf", "board.pdf", "not a readable PDF")
+
+    def test_empty_input_is_refused(self):
+        self.assert_refused(b"", "not a readable PDF")
+
+    def test_password_protected_pdf_is_refused(self):
+        doc = fitz.open()
+        doc.new_page().draw_line((10, 10), (50, 10))
+        locked = doc.tobytes(
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            user_pw="secret",
+            owner_pw="owner",
+        )
+        self.assert_refused(locked, "password")
+
+    def test_pdf_without_vector_drawings_is_refused(self):
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "Scanned page stand-in")
+        doc.new_page()
+        self.assert_refused(doc.tobytes(), "no vector drawings", "Scanned")
+
+    def test_page_over_the_drawing_budget_is_refused_by_page_number(self):
+        doc = fitz.open()
+        doc.new_page().draw_line((10, 10), (50, 10))
+        dense = doc.new_page()
+        for offset in range(4):
+            dense.draw_line((10, 10 + offset), (50, 10 + offset))
+        with mock.patch.object(pdf2kicad, "MAX_PAGE_DRAWINGS", 3):
+            self.assert_refused(doc.tobytes(), "Page 2", "4 drawing", "limit is 3")
+
+    def test_page_exactly_at_the_drawing_budget_is_converted(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        for offset in range(3):
+            page.draw_line((10, 10 + offset), (50, 10 + offset))
+        with mock.patch.object(pdf2kicad, "MAX_PAGE_DRAWINGS", 3):
+            files, summary = pdf2kicad.convert_pdf_bytes(doc.tobytes(), "b.pdf")
+        self.assertEqual(len(summary["pages"]), 1)
+
+    def test_drawing_budget_separates_schematics_from_layout_plots(self):
+        # Densest schematic page in the corpus: 5,321 drawings; smallest
+        # document that stalls the converter: 14,318.
+        self.assertGreater(pdf2kicad.MAX_PAGE_DRAWINGS, 2 * 5321)
+        self.assertLess(pdf2kicad.MAX_PAGE_DRAWINGS, 14318)
+
+    def test_command_line_reports_a_refusal_and_exits_with_status_1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.pdf"
+            path.write_bytes(b"plain text")
+            argv = ["pdf2kicad", str(path), str(Path(directory) / "out")]
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    pdf2kicad.main()
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("not a readable PDF", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertFalse((Path(directory) / "out").exists())
 
 
 if __name__ == "__main__":

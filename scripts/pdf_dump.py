@@ -2119,8 +2119,11 @@ def decode_page(page_data: dict) -> dict:
     }
 
 
-def extract_drawings(page, raw: bool):
+def extract_drawings(page, raw: bool, drawings=None):
     """Extract all drawing primitives from a page.
+
+    ``drawings`` is the page's ``get_drawings()`` result when the caller
+    already has it.
 
     Returns (lines, curves, rectangles) where:
       lines: [{"x1", "y1", "x2", "y2", "color", "width"}, ...]
@@ -2132,7 +2135,9 @@ def extract_drawings(page, raw: bool):
     curves = []
     rectangles = []
 
-    for d in page.get_drawings():
+    if drawings is None:
+        drawings = page.get_drawings()
+    for d in drawings:
         color = _color_hex(d.get('color'))
         fill = _color_hex(d.get('fill'))
         width = d.get('width') or 0
@@ -2230,9 +2235,15 @@ def extract_texts(page, raw: bool):
     return texts
 
 
-def dump_page(page, raw: bool, decode: bool = False, flavor: str | None = None) -> dict:
+def dump_page(
+    page,
+    raw: bool,
+    decode: bool = False,
+    flavor: str | None = None,
+    drawings=None,
+) -> dict:
     """Extract all vector elements from a single page."""
-    lines, curves, rectangles = extract_drawings(page, raw)
+    lines, curves, rectangles = extract_drawings(page, raw, drawings)
     texts = extract_texts(page, raw)
 
     pw, ph = page.rect.width, page.rect.height
