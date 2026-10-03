@@ -1,6 +1,7 @@
 # Browser-only web converter on GitHub Pages
 
-Status: approved 2026-10-03; implemented, not yet deployed
+Status: approved 2026-10-03; deployed 2026-10-03 at
+<https://andrei-errapart.github.io/Pdf2KiCad/>
 Date: 2026-10-03
 Tracking: beads epic `Pdf2KiCad-gna`
 
@@ -525,3 +526,17 @@ adds to the design above.
   drag-and-drop, paste, opening the download in KiCad, a real phone, and the
   deployed site on GitHub Pages. The worker's refusal of a cross-origin
   `fetch` was checked in the spike, under the same policy, not again here.
+- **Deployment.** Pages was enabled with the `gh` command above before the
+  first push, and the first workflow run built, tested and deployed in under
+  a minute. A cold visit transfers 23.8 MB: GitHub Pages does gzip the wasm
+  (2.9 MB instead of 8.6 MB) and serves the 18.1 MB wheel as it is. The
+  runtime takes 13–15 s to become ready on a first visit over the network
+  used for the check, against about 2 s from localhost.
+- **Verification of the deployed site.** The same Playwright checklist
+  passed against the deployed site in Chromium, Firefox and WebKit, with two
+  additions: the footer shows the deployed commit, and a `fetch` to another
+  origin from a `blob:`-started worker is refused in all three. A project
+  converted by the page was loaded by `kicad-cli` 10.0.6, which exported a
+  netlist from it. Still not checked, and tracked as `Pdf2KiCad-gna.8`:
+  drag-and-drop, paste, opening the download in the KiCad application, and
+  a real phone.
