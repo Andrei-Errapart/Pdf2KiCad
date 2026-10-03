@@ -107,13 +107,63 @@ the `dsn2kicad.hs` convention (for example,
 `03_Power_Sequencing.kicad_sch`). An object-free first page is
 named `01_NOTE.kicad_sch`.
 
+The converter refuses input it cannot do anything useful with, printing a
+one-line reason and exiting with status 1: a file that is not a readable PDF,
+a password-protected PDF, a PDF with no vector drawings on any page (a scan),
+and a PDF with a page of more than 12,000 drawing objects. The last is how
+PCB layout plots and placement maps are told from schematic sheets — a layout
+page carries far more drawing objects than a schematic sheet — and it replaces
+a decode that would otherwise run for many minutes.
+
+## Web converter
+
+The same converter runs in a browser at
+<https://andrei-errapart.github.io/Pdf2KiCad/>: drop a schematic PDF, or a
+ZIP archive containing exactly one, look at what was recovered from each
+page and at a preview of the sheets, and download the KiCad project as a
+ZIP. The conversion happens in the browser tab and the file is not uploaded
+anywhere; the site is static and has no server-side component.
+
+The page does not contain a second implementation. It runs
+`scripts/pdf2kicad.py` and `scripts/pdf_dump.py` themselves under
+[Pyodide](https://pyodide.org), with PyMuPDF's WebAssembly build, and a test
+holds its output byte-identical to the native converter's. Expect a first
+visit to download about 24 MB, and a conversion to take roughly twice as
+long as on the command line. Files up to 32 MiB are accepted.
+
+`web/` is the site as served. Its own files are plain HTML and ES modules
+with no build step; two things are assembled beside them by
+`scripts/build-web`, which CI also runs:
+
+```sh
+scripts/build-web                      # fills web/runtime/ and web/py/
+python3 -m http.server -d web 8000     # then open http://localhost:8000/
+```
+
+`web/runtime/` receives Pyodide and the PyMuPDF wheel, downloaded at pinned
+versions and checked against SHA-256 hashes recorded in the script;
+`web/py/` receives copies of the Python sources. Neither is committed. Run
+the script again after changing anything under `scripts/`.
+`.github/workflows/pages.yml` runs all the tests and redeploys the site on
+every push to `main`. Third-party code and its licences are recorded in
+`web/vendor/README.md`, and the design in
+`doc/specs/2026-10-03-web-converter-design.md`.
+
 ## Validation
 
 Run the self-contained unit tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
+node --test tests/web/*.test.mjs
 ```
+
+The first also runs `tests/test_web_parity.py`, which converts a synthetic
+schematic natively and through the web converter's runner under Node and
+requires identical output; the second covers the page's own modules. The
+tests that need `web/runtime/` are skipped until `scripts/build-web` has
+been run, and fail instead when `PDF2KICAD_REQUIRE_WEB=1` is set, as it is in
+CI.
 
 For connectivity comparisons, export the generated schematic's netlist with
 `kicad-cli sch export netlist`.
@@ -127,9 +177,15 @@ can be reused or upstreamed within the KiCad ecosystem. Every source file
 carries an `SPDX-License-Identifier: GPL-2.0-or-later` header.
 
 The only runtime dependency, PyMuPDF, is installed by the wrapper rather than
-bundled here; it is dual-licensed under AGPL-3.0-or-later or an Artifex
-commercial license. The "or later" in this project's own license is what keeps
-a combined distribution possible — a recipient may take `pdf2kicad` under
-GPL-3.0, whose section 13 permits combination with AGPL-3.0 code. Anyone
-redistributing the two together must still satisfy PyMuPDF's terms, or hold a
-commercial license for it.
+bundled in this repository; it is dual-licensed under AGPL-3.0-or-later or an
+Artifex commercial license. The "or later" in this project's own license is
+what keeps a combined distribution possible — a recipient may take
+`pdf2kicad` under GPL-3.0, whose section 13 permits combination with AGPL-3.0
+code. Anyone redistributing the two together must still satisfy PyMuPDF's
+terms, or hold a commercial license for it.
+
+The web converter is such a combined distribution: the site serves PyMuPDF's
+WebAssembly wheel, which contains MuPDF, beside this project's code. It does
+so under the AGPL, and the page footer links the source of both at the
+released versions it serves. The other third-party components of the site
+are listed with their licences in `web/vendor/README.md`.
