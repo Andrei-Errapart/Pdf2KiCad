@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Nothing on this page may contact another origin.  The worker inherits this
+  policy because app.js starts it from a blob: URL.  'self' still allows a
+  request to this site itself; that the visitor's file is never sent anywhere
+  is a property of the code, not of this policy.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; child-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<meta name="description" content="Convert schematic PDFs printed from OrCAD Capture or Altium Designer into KiCad projects in your browser. Your file never leaves your computer.">
+<title>PDF to KiCad</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="masthead">
+  <h1>PDF <span aria-hidden="true">→</span><span class="visually-hidden">to</span> KiCad</h1>
+  <p class="lede">Reconstructs an editable KiCad project from a schematic PDF.</p>
+  <p class="privacy">Conversion runs entirely in this browser tab. Your file is not uploaded anywhere.</p>
+  <ul class="scope">
+    <li><strong>Works with</strong> vector schematic PDFs printed from OrCAD Capture or Altium Designer.</li>
+    <li><strong>Does not work with</strong> scanned or image-only PDFs, PCB layout plots, or PDFs from other tools.</li>
+    <li>The result is rebuilt from the PDF’s drawing strokes and text, so <strong>check it in KiCad</strong> before relying on it.</li>
+  </ul>
+</header>
+
+<main>
+  <section id="drop" class="drop" data-over="false" aria-labelledby="drop-title">
+    <h2 id="drop-title">Drop a schematic <code>.pdf</code> here</h2>
+    <p>or a <code>.zip</code> archive containing exactly one.
+       You can also paste a copied file.</p>
+    <label class="button primary">
+      Choose a file…
+      <input id="picker" type="file" accept=".pdf,.PDF,application/pdf,.zip,application/zip">
+    </label>
+  </section>
+
+  <form id="options" class="options">
+    <fieldset>
+      <legend>Options</legend>
+      <label><input type="checkbox" name="kicadRcl"> Use KiCad resistor, capacitor and inductor symbols</label>
+      <label><input type="checkbox" name="inferFootprints"> Infer footprints for two-terminal SMD passives</label>
+      <label><input type="checkbox" name="noGraphics"> Omit leftover PDF graphics</label>
+      <label class="select">Sheet size
+        <select name="paper">
+          <option value="">Detect from the title block</option>
+          <option value="A4">A4</option>
+          <option value="A3">A3</option>
+          <option value="A2">A2</option>
+          <option value="A1">A1</option>
+          <option value="A0">A0</option>
+        </select>
+      </label>
+      <label class="select">Tool that printed the PDF
+        <select name="flavor">
+          <option value="">Detect automatically</option>
+          <option value="orcad">OrCAD Capture</option>
+          <option value="altium">Altium Designer</option>
+        </select>
+      </label>
+    </fieldset>
+  </form>
+
+  <p id="runtime" class="runtime" data-state="loading" role="status">
+    Loading the converter — about 24&nbsp;MB on a first visit…
+  </p>
+
+  <div id="status" class="status" data-state="idle" role="status" aria-live="polite">
+    <span id="status-text"></span>
+    <button id="cancel" class="button" type="button" hidden>Cancel</button>
+  </div>
+
+  <section id="result" class="result" hidden aria-labelledby="result-name">
+    <div class="result-bar">
+      <div>
+        <h2 id="result-name"></h2>
+        <p id="result-detail" class="detail"></p>
+      </div>
+      <button id="download" class="button primary" type="button">Download</button>
+    </div>
+
+    <h3>What was recovered</h3>
+    <p id="summary-headline" class="summary-headline"></p>
+    <div class="summary-scroll">
+      <table id="summary" class="summary"></table>
+    </div>
+
+    <h3>Preview</h3>
+    <div class="preview">
+      <nav id="sheets" class="sheets" aria-label="Sheets"></nav>
+      <div id="viewer" class="viewer"></div>
+    </div>
+    <p id="preview-note" class="preview-note" hidden></p>
+    <p class="detail">The preview is drawn by KiCanvas and is indicative only; open the
+       downloaded project in KiCad to check it. Every sheet’s title block shows
+       sheet 1/1 in the preview.</p>
+  </section>
+</main>
+
+<footer class="footer">
+  <p>
+    <a href="https://github.com/Andrei-Errapart/Pdf2KiCad">pdf2kicad</a>
+    is free software under the GNU GPL, version 2 or later.
+    This build: <a id="version" href="https://github.com/Andrei-Errapart/Pdf2KiCad">development build</a>.
+  </p>
+  <p>
+    PDF reading by <a href="https://github.com/pymupdf/PyMuPDF/tree/1.28.0">PyMuPDF 1.28.0</a>
+    and <a href="https://github.com/ArtifexSoftware/mupdf/tree/1.28.0">MuPDF 1.28.0</a>, both under the
+    GNU AGPL, version 3; the links lead to their source code.
+    Python by <a href="https://github.com/pyodide/pyodide/tree/0.29.5">Pyodide 0.29.5</a> (MPL-2.0).
+  </p>
+  <p>
+    Preview by <a href="https://kicanvas.org">KiCanvas</a> (MIT).
+    ZIP handling by <a href="https://github.com/101arrowz/fflate">fflate</a> (MIT).
+    The standard resistor, capacitor, inductor and connector symbols come from the
+    <a href="https://gitlab.com/kicad/libraries/kicad-symbols">KiCad symbol libraries</a>
+    (CC-BY-SA 4.0 with the KiCad Library Exception).
+  </p>
+</footer>
+</body>
+</html>

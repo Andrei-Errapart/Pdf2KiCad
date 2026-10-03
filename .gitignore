@@ -6,3 +6,8 @@ __pycache__/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Web converter build products (scripts/build-web, the deploy workflow)
+web/runtime/
+web/py/
+web/version.json
