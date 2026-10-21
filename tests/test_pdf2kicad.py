@@ -3684,6 +3684,18 @@ class AltiumNormalizationTests(unittest.TestCase):
             (10.0, 16.0, 20.0, 16.0),
         )
 
+    def test_coincident_coordinates_snap_together_across_a_grid_midpoint(self):
+        # TE0725LP U1 pin P4: the pin and its wire differ by float noise
+        # straddling 76.925, which rounds them to different grid points.
+        page = altium_page(lines=[
+            altium_line("#000080", 169.971, 76.928, 190.307, 76.928),
+            altium_line("#000000", 164.89, 76.923, 169.971, 76.923),
+        ])
+        pdf_dump.normalize_altium_page(page)
+        wire_line, pin_line = page["lines"]
+        self.assertEqual(wire_line["y1"], pin_line["y1"])
+        self.assertIn(wire_line["y1"], (76.9, 76.95))
+
     def test_reference_text_filter(self):
         times = altium_text("R117", 10.0, 10.0, 14.0, 12.3, "#000000")
         courier = altium_text("H65", 10.0, 10.0, 14.0, 12.3, "#000000",
@@ -3755,6 +3767,31 @@ class AltiumNetLabelTests(unittest.TestCase):
         labels = pdf2kicad.decode_net_labels_altium(page, wires, set())
         self.assertEqual(labels, [])
 
+    def test_stacked_label_takes_the_wire_under_its_baseline(self):
+        # TE0725LP V_P/V_N: the lower label's top edge grazes the upper wire
+        # more closely than its baseline touches its own.
+        wires = [wire(144.55, 120.1, 159.8, 120.1),
+                 wire(144.55, 122.65, 159.8, 122.65)]
+        page = altium_page(texts=[
+            altium_text("V_P", 147.076, 117.553, 151.133, 120.079,
+                        "#800000"),
+            altium_text("V_N", 147.076, 120.088, 151.512, 122.614,
+                        "#800000"),
+        ])
+        labels = pdf2kicad.decode_net_labels_altium(page, wires, set())
+        self.assertEqual(
+            {label["name"]: label["point"][1] for label in labels},
+            {"V_P": 120.1, "V_N": 122.65},
+        )
+
+    def test_label_under_its_wire_still_attaches(self):
+        wires = [wire(45.0, 142.95, 70.0, 142.95)]
+        page = altium_page(texts=[
+            altium_text("GND", 50.0, 144.22, 55.0, 146.74, "#800000"),
+        ])
+        labels = pdf2kicad.decode_net_labels_altium(page, wires, set())
+        self.assertEqual([label["point"][1] for label in labels], [142.95])
+
 
 class AltiumPowerPortTests(unittest.TestCase):
     def test_ground_bar_glyph(self):
@@ -3803,6 +3840,112 @@ class AltiumPowerPortTests(unittest.TestCase):
         self.assertEqual(len(ports), 1)
         self.assertEqual(ports[0]["name"], "3.3V")
         self.assertEqual(ports[0]["glyph"], "supply")
+
+    def test_ganged_ground_bars_each_get_a_port(self):
+        # TE0725LP U2 A0-A2: three GND bars stacked end to end form one
+        # stroke cluster; each stem ends on its own pin.  The leftover name
+        # must not become a GND label on the WP wire below.
+        wp_wire = wire(192.85, 41.35, 215.75, 41.35)
+        rows = (33.75, 36.3, 38.85)
+        lines = []
+        texts = []
+        for row, (top, bottom) in zip(rows, ((32.5, 35.0), (35.0, 37.55),
+                                             (37.55, 40.1))):
+            lines.append(altium_line("#800000", 213.2, top, 213.2, bottom))
+            lines.append(altium_line("#800000", 215.75, row, 213.2, row))
+            texts.append(altium_text("GND", 207.776, top - 0.008, 212.677,
+                                     bottom - 0.012, "#800000"))
+        page = altium_page(lines=lines, texts=texts)
+        components = [{"pins": [{"hot": {"x": 215.75, "y": row}}
+                                for row in (*rows, 41.35)]}]
+        consumed_texts = set()
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, [wp_wire], components, consumed_texts, set(), set()
+        )
+        self.assertEqual(
+            [(port["name"], port["point"], port["angle"]) for port in ports],
+            [("GND", (215.75, row), 270) for row in rows],
+        )
+        self.assertEqual(
+            pdf2kicad.decode_net_labels_altium(page, [wp_wire],
+                                               consumed_texts),
+            [],
+        )
+
+    def test_port_name_is_not_a_net_label_on_its_own_wire(self):
+        # WeAct STM32G474 P1: a VCC bar and a GND earth share one stroke
+        # cluster; the PB12 net label directly below overlaps it but sits on
+        # its own wire, so it is not a port name.
+        wires = [wire(98.1, 68.6, 101.85, 68.6),
+                 wire(98.1, 70.45, 101.85, 70.45),
+                 wire(97.2, 72.3, 101.85, 72.3),
+                 wire(97.2, 74.2, 101.85, 74.2)]
+        page = altium_page(
+            lines=[
+                altium_line("#800000", 96.25, 67.65, 96.25, 69.55),
+                altium_line("#800000", 98.1, 68.6, 96.25, 68.6),
+                altium_line("#800000", 96.25, 68.6, 96.25, 72.3),
+                altium_line("#800000", 95.7, 69.15, 95.7, 71.75),
+                altium_line("#800000", 95.15, 69.7, 95.15, 71.2),
+                altium_line("#800000", 94.6, 70.3, 94.6, 70.65),
+                altium_line("#800000", 98.1, 70.45, 96.25, 70.45),
+            ],
+            texts=[
+                altium_text("VCC", 92.475, 67.859, 95.896, 69.553,
+                            "#800000"),
+                altium_text("GND", 90.444, 69.719, 94.043, 71.413,
+                            "#800000"),
+                altium_text("PB12", 97.128, 70.65, 100.86, 72.343,
+                            "#800000"),
+                altium_text("PB14", 97.128, 72.51, 100.86, 74.203,
+                            "#800000"),
+            ],
+        )
+        consumed_texts = set()
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, wires, [], consumed_texts, set(), set()
+        )
+        self.assertEqual(
+            [(port["name"], port["point"]) for port in ports],
+            [("VCC", (98.1, 68.6)), ("GND", (98.1, 70.45))],
+        )
+        labels = pdf2kicad.decode_net_labels_altium(page, wires,
+                                                    consumed_texts)
+        self.assertEqual(
+            [(label["name"], label["point"][1]) for label in labels],
+            [("PB12", 72.3), ("PB14", 74.2)],
+        )
+
+    def test_clustered_ports_share_out_names_nearest_first(self):
+        # WeAct STM32G474 long, USB-C J1: a GND earth above a VBUS bar.  The
+        # VBUS name is nearer the earth than the GND name is, but nearer
+        # still to its own bar.
+        wires = [wire(99.05, 147.7, 95.35, 147.7),
+                 wire(99.05, 149.55, 97.2, 149.55)]
+        page = altium_page(
+            lines=[
+                altium_line("#800000", 93.45, 145.8, 97.2, 145.8),
+                altium_line("#800000", 94.0, 145.25, 96.65, 145.25),
+                altium_line("#800000", 94.6, 144.7, 96.05, 144.7),
+                altium_line("#800000", 95.15, 144.15, 95.5, 144.15),
+                altium_line("#800000", 95.35, 147.7, 95.35, 145.8),
+                altium_line("#800000", 95.35, 148.6, 95.35, 150.45),
+                altium_line("#800000", 97.2, 149.55, 95.35, 149.55),
+            ],
+            texts=[
+                altium_text("GND", 93.49, 142.263, 97.089, 143.957,
+                            "#800000"),
+                altium_text("VBUS", 90.529, 148.773, 94.949, 150.467,
+                            "#800000"),
+            ],
+        )
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, wires, [], set(), set(), set()
+        )
+        self.assertEqual(
+            [(port["name"], port["point"]) for port in ports],
+            [("GND", (95.35, 147.7)), ("VBUS", (97.2, 149.55))],
+        )
 
 
 class AltiumWorksheetTests(unittest.TestCase):
@@ -3937,6 +4080,104 @@ class AltiumPageDecodeTests(unittest.TestCase):
         )
         self.assertIn('(global_label "EN1"', rendered)
         self.assertIn('(property "Reference" "U7"', rendered)
+
+
+# A PDF/A re-encoder (3-Heights, TE0725LP schematic) moves every channel of
+# the Altium palette by an LSB or two, as observed in that file.
+PDFA_SHIFTED_COLORS = {
+    "#000080": "#000081",
+    "#800000": "#810000",
+    "#ffffb0": "#feffb1",
+    "#ff0000": "#fe0000",
+    "#0000ff": "#0000fe",
+    "#4b4b94": "#4c4c95",
+    "#bfbfbf": "#c0c0c0",
+    "#d0a2a2": "#d1a4a4",
+}
+
+
+def shift_page_colors(page):
+    for key in ("lines", "curves", "rectangles", "texts"):
+        for primitive in page[key]:
+            for field in ("color", "fill"):
+                color = primitive.get(field)
+                if color in PDFA_SHIFTED_COLORS:
+                    primitive[field] = PDFA_SHIFTED_COLORS[color]
+    return page
+
+
+class AltiumShiftedPaletteTests(unittest.TestCase):
+    def test_near_palette_colors_snap_to_the_altium_palette(self):
+        page = altium_page(
+            lines=[
+                altium_line("#000081", 10.0, 10.0, 20.0, 10.0),
+                altium_line("#0000fe", 30.0, 10.0, 32.0, 12.0),
+                altium_line("#d1a4a4", 40.0, 10.0, 42.0, 12.0),
+            ],
+            rectangles=[{
+                "x0": 100.0, "y0": 100.0, "x1": 110.0, "y1": 110.0,
+                "color": None, "fill": "#feffb1", "width": 0.0,
+            }],
+            texts=[
+                altium_text("1V8", 50.0, 50.0, 53.0, 52.3, "#810000"),
+                altium_text("R210", 30.0, 30.0, 34.0, 32.3, "#c0c0c0"),
+            ],
+        )
+        pdf_dump.normalize_altium_page(page)
+        wire, graphic, dimmed = page["lines"]
+        self.assertEqual(wire["color"], pdf_dump.WIRE_COLOR)
+        self.assertEqual(graphic["color"], pdf_dump.BODY_COLOR)
+        self.assertEqual(dimmed["color"], pdf_dump.ALTIUM_ACCENT_COLOR)
+        self.assertEqual(page["rectangles"][0]["color"], pdf_dump.BODY_COLOR)
+        net_label, dnp_ref = page["texts"]
+        self.assertEqual(net_label["color"], pdf_dump.ALTIUM_ACCENT_COLOR)
+        self.assertTrue(dnp_ref["dnp"])
+
+    def test_snapped_color_is_not_a_recoloring(self):
+        # Pin-number recovery skips recolored texts; a snapped navy span must
+        # decode exactly as the unshifted one would.
+        arial_navy = altium_text("13", 250.0, 100.0, 252.0, 102.3, "#000081",
+                                 font="Arial")
+        page = altium_page(texts=[arial_navy])
+        pdf_dump.normalize_altium_page(page)
+        self.assertEqual(arial_navy["color"], pdf_dump.ALTIUM_TEXT_COLOR)
+        self.assertNotIn("source_color", arial_navy)
+
+    def test_distant_colors_are_left_alone(self):
+        sheet_text = altium_text("B15", 50.0, 50.0, 53.0, 52.3, "#00008c",
+                                 font="Arial")
+        port_line = altium_line("#990000", 10.0, 10.0, 20.0, 10.0)
+        page = altium_page(lines=[port_line], texts=[sheet_text])
+        pdf_dump.normalize_altium_page(page)
+        self.assertEqual(sheet_text["color"], "#00008c")
+        self.assertEqual(port_line["color"], "#990000")
+
+    def test_navy_junction_dot_recolors(self):
+        page = altium_page(
+            curves=junction_dot_curves(85.0, 105.0, color="#000081"),
+        )
+        pdf_dump.normalize_altium_page(page)
+        for curve in page["curves"]:
+            self.assertEqual(curve["color"], "#ff0000")
+            self.assertEqual(curve["fill"], "#ff0000")
+
+    def test_full_page_decode_survives_pdfa_color_shift(self):
+        page = shift_page_colors(AltiumPageDecodeTests._page())
+        pdf_dump.normalize_altium_page(page)
+        page["decoded"] = pdf_dump.decode_page(page)
+        semantic = pdf2kicad.decode_page(page)
+
+        self.assertEqual(
+            [component["reference"] for component in semantic["components"]],
+            ["U7"],
+        )
+        self.assertEqual(semantic["components"][0]["value"], "LDO")
+        self.assertEqual(len(semantic["wires"]), 3)
+        self.assertEqual(semantic["junctions"], [(85.0, 105.0)])
+        self.assertEqual(semantic["no_connects"], [(115.1, 105.0)])
+        self.assertEqual(
+            [label["name"] for label in semantic["global_labels"]], ["EN1"]
+        )
 
 
 def wire(x1, y1, x2, y2):

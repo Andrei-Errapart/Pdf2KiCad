@@ -3051,10 +3051,8 @@ def decode_power_ports_altium(
         for component in components
         for pin in component.get("pins", [])
     ]
-    ports = []
-    seen = set()
+    glyphs = []
     for group in groups.values():
-        bbox = _bbox_union(*(records[item][3] for item in group))
         glyph_points = [
             point
             for item in group
@@ -3066,40 +3064,62 @@ def decode_power_ports_altium(
         ]
         if not glyph_points:
             continue
-        hot = None
         hits = []
         for point in glyph_points:
             wire_hit = _point_on_any_wire(point, wires, 0.3)
             if wire_hit:
                 hits.append((wire_hit[0], wire_hit[1]))
-        if hits:
-            hot = min(hits)[1]
-        else:
-            pin_hits = [
+        if not hits:
+            hits = [
                 (_distance(point, pin), pin)
                 for point in glyph_points
                 for pin in pin_hots
                 if _distance(point, pin) <= 0.3
             ]
-            if pin_hits:
-                hot = min(pin_hits)[1]
-        if hot is None:
-            continue
-        names = []
-        for text in page["texts"]:
+        hots = []
+        for _hit_distance, point in sorted(hits):
+            if all(_distance(point, other) > 0.5 for other in hots):
+                hots.append(point)
+        if len(hots) == 1:
+            glyphs.append((hots[0], group))
+        else:
+            # Ganged ports drawn edge to edge (GND bars on adjacent pins)
+            # cluster into one group; each stem's hotpoint is its own port.
+            glyphs.extend(
+                (hot, _power_glyph_at(records, group, hot)) for hot in hots
+            )
+
+    # Share the names out nearest pair first, page-wide: a port's name may
+    # lie closer to a neighbouring glyph than that neighbour's own name.
+    pairs = []
+    for glyph_index, (_hot, items) in enumerate(glyphs):
+        bbox = _bbox_union(*(records[item][3] for item in items))
+        for text_index, text in enumerate(page["texts"]):
             value = text.get("text", "").strip()
             if (
                 text.get("color") != accent
                 or _text_key(text) in consumed_texts
                 or not ALTIUM_NET_NAME_RE.match(value)
+                or _altium_label_on_wire(text, wires)
             ):
                 continue
             distance = _bbox_distance(bbox, _text_bbox(text))
             if distance <= 4.0:
-                names.append((distance, text))
-        if not names:
+                pairs.append((distance, glyph_index, text_index))
+    named = {}
+    taken = set()
+    for _distance_to_text, glyph_index, text_index in sorted(pairs):
+        if glyph_index not in named and text_index not in taken:
+            named[glyph_index] = page["texts"][text_index]
+            taken.add(text_index)
+
+    ports = []
+    seen = set()
+    for glyph_index, (hot, items) in enumerate(glyphs):
+        if glyph_index not in named:
             continue
-        _score, text = min(names, key=lambda entry: entry[0])
+        bbox = _bbox_union(*(records[item][3] for item in items))
+        text = named[glyph_index]
         name = text["text"].strip()
         key = (name, round(hot[0], 2), round(hot[1], 2))
         if key in seen:
@@ -3107,7 +3127,7 @@ def decode_power_ports_altium(
         seen.add(key)
         glyph = (
             "supply"
-            if any(records[item][0] == "curve" for item in group)
+            if any(records[item][0] == "curve" for item in items)
             else "ground"
         )
         center = (
@@ -3125,7 +3145,7 @@ def decode_power_ports_altium(
             else {"up": 0, "left": 90, "down": 180, "right": 270}
         )
         line_indexes = sorted(
-            records[item][1] for item in group if records[item][0] == "line"
+            records[item][1] for item in items if records[item][0] == "line"
         )
         ports.append({
             "name": name,
@@ -3139,10 +3159,46 @@ def decode_power_ports_altium(
         consumed_texts.add(_text_key(text))
         consumed_lines.update(line_indexes)
         consumed_curves.update(
-            records[item][1] for item in group if records[item][0] == "curve"
+            records[item][1] for item in items if records[item][0] == "curve"
         )
     ports.sort(key=lambda port: (port["point"][1], port["point"][0]))
     return ports
+
+
+def _altium_label_on_wire(text: dict, wires: list[dict]) -> bool:
+    """Whether an upright text's baseline lies on a wire, as a net label's
+    does; a power port's name stands clear of the wiring."""
+    if int(round(text.get("angle", 0))) % 360 != 0:
+        return False
+    bbox = _text_bbox(text)
+    baseline_points = [
+        (bbox["x0"], bbox["y1"]),
+        ((bbox["x0"] + bbox["x1"]) / 2, bbox["y1"]),
+        (bbox["x1"], bbox["y1"]),
+    ]
+    return _nearest_wire_point(baseline_points, wires, 0.3) is not None
+
+
+def _power_glyph_at(records: list, group: list[int], hot) -> list[int]:
+    """The stem ending at ``hot`` plus the glyph strokes touching it."""
+    stems = [
+        item
+        for item in group
+        if records[item][0] == "line"
+        and min(
+            _distance(_point(records[item][2], 1), hot),
+            _distance(_point(records[item][2], 2), hot),
+        ) <= 0.3
+    ]
+    return [
+        item
+        for item in group
+        if item in stems
+        or any(
+            _bboxes_touch(records[item][3], records[stem][3], 0.3)
+            for stem in stems
+        )
+    ]
 
 
 def decode_net_labels_altium(
@@ -3175,7 +3231,17 @@ def decode_net_labels_altium(
             (bbox["x0"], (bbox["y0"] + bbox["y1"]) / 2),
             (bbox["x1"], (bbox["y0"] + bbox["y1"]) / 2),
         ]
-        hit = _nearest_wire_point(probe_points, wires, max_distance)
+        hit = None
+        if int(round(text.get("angle", 0))) % 360 == 0:
+            # The label is anchored on its baseline: in a 2.54 mm stack the
+            # top edge can graze the wire above closer than the baseline
+            # touches its own.
+            baseline_points = [
+                point for point in probe_points if point[1] == bbox["y1"]
+            ]
+            hit = _nearest_wire_point(baseline_points, wires, max_distance)
+        if not hit:
+            hit = _nearest_wire_point(probe_points, wires, max_distance)
         if not hit:
             continue
         point = hit[1]

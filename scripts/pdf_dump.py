@@ -52,7 +52,8 @@ ALTIUM_WIRE_COLOR = "#000080"
 ALTIUM_GRAPHIC_COLOR = "#0000ff"
 ALTIUM_BODY_FILL = "#ffffb0"
 ALTIUM_ACCENT_COLOR = "#800000"  # body outlines, power glyphs, net labels
-ALTIUM_JUNCTION_FILLS = ("#4b4b94", "#4c4c94")
+# Blue-gray by default; navy where the scheme gives junctions the wire color.
+ALTIUM_JUNCTION_FILLS = ("#4b4b94", "#4c4c94", ALTIUM_WIRE_COLOR)
 ALTIUM_NOERC_COLOR = "#ff0000"
 ALTIUM_TEXT_COLOR = "#000080"  # designators, values, comments
 # Not-fitted variant parts print dimmed: gray symbols/texts, pink power
@@ -61,6 +62,20 @@ ALTIUM_TEXT_COLOR = "#000080"  # designators, values, comments
 ALTIUM_DNP_COLOR = "#bfbfbf"
 ALTIUM_DNP_DRAW_COLORS = ("#bebebe", "#bfbfbf")
 ALTIUM_DIMMED_ACCENT_COLOR = "#d0a2a2"
+# PDF/A re-encoders (3-Heights) pass colors through a color-space transform
+# that moves each 8-bit channel by up to two LSB (#000080 -> #000081,
+# #d0a2a2 -> #d1a4a4).  Colors this close to the palette are snapped back.
+ALTIUM_PALETTE = (
+    ALTIUM_WIRE_COLOR,
+    ALTIUM_GRAPHIC_COLOR,
+    ALTIUM_BODY_FILL,
+    ALTIUM_ACCENT_COLOR,
+    *ALTIUM_JUNCTION_FILLS,
+    ALTIUM_NOERC_COLOR,
+    *ALTIUM_DNP_DRAW_COLORS,
+    ALTIUM_DIMMED_ACCENT_COLOR,
+)
+ALTIUM_PALETTE_TOL = 3
 GEOM_TOL = 0.18
 EDGE_TOL = 0.30
 MIN_SYMBOL_W = 2.0
@@ -1824,25 +1839,93 @@ def _snap(value: float) -> float:
     return round(round(value / ALTIUM_SNAP_MM) * ALTIUM_SNAP_MM, 3)
 
 
+# Coordinates this close are one point in the source: a pin end and its wire
+# can straddle a grid midpoint (76.923 vs 76.928) and round apart.
+ALTIUM_MERGE_MM = 0.02
+
+
+def _snap_axis(values) -> dict[float, float]:
+    """Grid-snap values, sending each run of near-equal values to one point."""
+    mapping = {}
+    cluster = []
+
+    def flush():
+        snapped = _snap(sum(cluster) / len(cluster))
+        for value in cluster:
+            mapping[value] = snapped
+
+    for value in sorted(set(values)):
+        if cluster and value - cluster[-1] > ALTIUM_MERGE_MM:
+            flush()
+            cluster = []
+        cluster.append(value)
+    if cluster:
+        flush()
+    return mapping
+
+
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+_ALTIUM_PALETTE_RGB = [(color, _hex_rgb(color)) for color in ALTIUM_PALETTE]
+
+
+def _snap_altium_color(color: str | None) -> str | None:
+    """The nearest Altium palette color within ALTIUM_PALETTE_TOL, else as is."""
+    if not color:
+        return color
+    rgb = _hex_rgb(color)
+    best = None
+    for candidate, candidate_rgb in _ALTIUM_PALETTE_RGB:
+        distance = max(abs(a - b) for a, b in zip(rgb, candidate_rgb))
+        if distance <= ALTIUM_PALETTE_TOL and (
+            best is None or distance < best[0]
+        ):
+            best = (distance, candidate)
+    return best[1] if best else color
+
+
 def normalize_altium_page(page_data: dict) -> None:
     """Recolor Altium drawing conventions into the OrCAD decode language.
 
-    Every recolored primitive keeps its original color in "source_color" so
-    residual graphics can still be emitted faithfully.  Stroke coordinates
-    are snapped to a 0.05 mm grid: llPDFLib emits sub-hundredth float noise
-    that would otherwise separate a pin end from its wire after rounding.
+    Colors a PDF/A re-encoder moved off the Altium palette are first snapped
+    back onto it; that restores the authored color, so it is not recorded as
+    a recoloring.  Every recolored primitive keeps its original color in
+    "source_color" so residual graphics can still be emitted faithfully.
+    Stroke coordinates are snapped to a 0.05 mm grid: llPDFLib emits
+    sub-hundredth float noise that would otherwise separate a pin end from
+    its wire after rounding.
     """
     lines = page_data["lines"]
     curves = page_data["curves"]
     rectangles = page_data["rectangles"]
     texts = page_data["texts"]
 
-    for line in lines:
-        for key in ("x1", "y1", "x2", "y2"):
-            line[key] = _snap(line[key])
-    for rectangle in rectangles:
-        for key in ("x0", "y0", "x1", "y1"):
-            rectangle[key] = _snap(rectangle[key])
+    for primitive in (*lines, *curves, *rectangles, *texts):
+        for key in ("color", "fill"):
+            if primitive.get(key):
+                primitive[key] = _snap_altium_color(primitive[key])
+
+    axes = (
+        (("x1", "x2"), ("x0", "x1")),
+        (("y1", "y2"), ("y0", "y1")),
+    )
+    for line_keys, rectangle_keys in axes:
+        mapping = _snap_axis(
+            [line[key] for line in lines for key in line_keys]
+            + [
+                rectangle[key]
+                for rectangle in rectangles
+                for key in rectangle_keys
+            ]
+        )
+        for line in lines:
+            for key in line_keys:
+                line[key] = mapping[line[key]]
+        for rectangle in rectangles:
+            for key in rectangle_keys:
+                rectangle[key] = mapping[rectangle[key]]
 
     body_boxes = _altium_body_boxes(page_data)
     page_data["altium_body_boxes"] = body_boxes

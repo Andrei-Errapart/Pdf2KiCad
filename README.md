@@ -51,12 +51,19 @@ Altium PDFs (llPDFLib producer) use a different drawing language, detected
 automatically from the PDF metadata or forced with `--flavor altium`.
 Normalization maps the Altium conventions onto the OrCAD decode pipeline:
 navy wires, black axis-aligned pin strokes, pale-yellow body fills, blue
-symbol art, blue-gray junction dots, red no-ERC crosses, and maroon net
-labels and power-port glyphs (bar, circle, and earth styles). Fully
-transparent marker text is dropped, coalesced designator/value spans are
-split, and coordinates are snapped to a 0.05 mm grid to absorb the
-generator's float noise. Because such projects use flat net-identifier
-scope, every net label becomes a KiCad global label. Titles, page numbers,
+symbol art, navy or blue-gray junction dots, red no-ERC crosses, and maroon
+net labels and power-port glyphs (bar, circle, and earth styles). Colors a
+PDF/A re-encoder has moved a few steps off this palette (for example
+`#000080` to `#000081`) are snapped back onto it. Fully transparent marker
+text is dropped, coalesced designator/value spans are split, and
+coordinates are snapped to a 0.05 mm grid to absorb the generator's float
+noise; coordinates within 0.02 mm of each other snap to the same grid point.
+A net label attaches to the wire under its baseline. Power ports drawn edge
+to edge, such as GND bars on adjacent pins, each become their own port, and
+port names are shared out nearest first; a text whose baseline lies on a
+wire is a net label, never a port name. Because such projects use flat
+net-identifier scope, every net label becomes a KiCad global label. Titles,
+page numbers,
 and sheet names are read from the sheet-template title block; the template
 itself stays residual graphics. Not-fitted variant parts print dimmed gray
 and are recovered with KiCad's native do-not-populate state. Multi-channel
