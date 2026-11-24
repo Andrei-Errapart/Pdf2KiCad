@@ -89,6 +89,20 @@ REF_RE = re.compile(
     r"^(?:U|CN|PCIE|JSW|J|P|R|C|LD|L|D|Q|Y|FB|NF|FL|GP|TP|SW|DSW|SD|SCR|SNAP"
     r"|SP|S|X|F|VR|V|H|MECH|MP|PM|KK|T)\d+[A-Z]?$"
 )
+# Altium libraries use designator prefixes Capture designs do not: relays
+# (K1A..K1D), board-to-board connectors (JM1), jumpers (JP1), batteries and
+# buzzers (B1), mounting holes (MH1), lamps (LP1), resistor networks and
+# variable parts (RN1, RV1, RT1), crystals (XT1), Zener diodes (ZD1).
+ALTIUM_REF_RE = re.compile(
+    r"^(?:U|CN|PCIE|JSW|JM|JP|J|P|RN|RV|RT|R|C|LD|LP|LS|L|D|Q|Y|FB|NF|FL|GP"
+    r"|TP|SW|DSW|SD|SCR|SNAP|SP|S|XT|X|F|VR|V|H|MECH|MH|MP|PM|KK|K|T|BT|B"
+    r"|ZD)\d+[A-Z]?$"
+)
+
+
+def reference_re(flavor: str | None = None) -> "re.Pattern[str]":
+    """The designator pattern of the authoring tool."""
+    return ALTIUM_REF_RE if flavor == "altium" else REF_RE
 # Annotation tokens that look like references but never are.
 REFERENCE_STOP_WORDS = {"X5R", "X6S", "X7R", "X8R", "C0G", "NP0", "Y5V", "Z5U"}
 
@@ -96,7 +110,10 @@ REFERENCE_STOP_WORDS = {"X5R", "X6S", "X7R", "X8R", "C0G", "NP0", "Y5V", "Z5U"}
 def is_reference_text(text: dict, flavor: str | None = None) -> bool:
     """Whether a text span can name a component reference."""
     value = text.get("text", "").strip()
-    if not REF_RE.match(value) or value.upper() in REFERENCE_STOP_WORDS:
+    if (
+        not reference_re(flavor).match(value)
+        or value.upper() in REFERENCE_STOP_WORDS
+    ):
         return False
     if text.get("color") != "#000000":
         return False
@@ -1886,6 +1903,72 @@ def _snap_altium_color(color: str | None) -> str | None:
     return best[1] if best else color
 
 
+def _point_segment_distance(point, start, end) -> float:
+    (px, py), (x1, y1), (x2, y2) = point, start, end
+    dx, dy = x2 - x1, y2 - y1
+    if dx == 0 and dy == 0:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+def _gray_line_free_ends(
+    lines: list[dict], rectangles: list[dict], curves: list[dict]
+) -> dict[int, int]:
+    """How many endpoints of each gray stroke touch no other gray drawing.
+
+    Altium prints a not-fitted part entirely in gray, so its pin stubs and
+    its body edges cannot be told apart by colour or width.  A pin stub
+    hangs off the body: one end touches the outline, the other is free.  A
+    body edge meets the rest of the outline at both ends.  Rectangles and
+    curves of the same part count as outline too.
+    """
+    gray = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if (
+            line.get("color") in ALTIUM_DNP_DRAW_COLORS
+            and _is_solid(line)
+            and 0.15 <= float(line.get("width") or 0.0) <= 0.4
+        )
+    ]
+    if not gray:
+        return {}
+    segments = []
+    for index, line in gray:
+        start, end = _line_points(line)
+        segments.append((index, start, end))
+    for rectangle in rectangles:
+        if rectangle.get("color") not in ALTIUM_DNP_DRAW_COLORS:
+            continue
+        x0, y0 = rectangle["x0"], rectangle["y0"]
+        x1, y1 = rectangle["x1"], rectangle["y1"]
+        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        for start, end in zip(corners, corners[1:]):
+            segments.append((None, start, end))
+    for curve in curves:
+        if curve.get("color") not in ALTIUM_DNP_DRAW_COLORS:
+            continue
+        points = [tuple(point) for point in curve.get("points", [])]
+        for start, end in zip(points, points[1:]):
+            segments.append((None, start, end))
+    touch = GEOM_TOL
+    result = {}
+    for index, line in gray:
+        free = 0
+        for point in _line_points(line):
+            held = any(
+                other_index != index
+                and _point_segment_distance(point, start, end) <= touch
+                for other_index, start, end in segments
+            )
+            if not held:
+                free += 1
+        result[index] = free
+    return result
+
+
 def normalize_altium_page(page_data: dict) -> None:
     """Recolor Altium drawing conventions into the OrCAD decode language.
 
@@ -1952,7 +2035,9 @@ def normalize_altium_page(page_data: dict) -> None:
             _remember_color(rectangle)
             rectangle["color"] = BODY_COLOR
 
-    for line in lines:
+    gray_free_ends = _gray_line_free_ends(lines, rectangles, curves)
+
+    for index, line in enumerate(lines):
         color = line.get("color")
         width = float(line.get("width") or 0.0)
         length = _line_length(line)
@@ -1981,12 +2066,17 @@ def normalize_altium_page(page_data: dict) -> None:
             and _is_solid(line)
             and 0.15 <= width <= 0.4
         ):
-            # A not-fitted part is drawn entirely in gray: recover its pin
-            # stubs and body graphics so the symbol survives with dnp set.
+            # A not-fitted part is drawn entirely in gray, so pin stubs and
+            # body edges share colour and width.  A pin stub touches the
+            # body at one end only; a body edge is held at both ends.
             _remember_color(line)
             line["color"] = (
                 PIN_COLOR
-                if axis_aligned and 2.0 <= length <= 8.2
+                if (
+                    axis_aligned
+                    and 1.0 <= length <= 8.2
+                    and gray_free_ends.get(index) == 1
+                )
                 else BODY_COLOR
             )
         elif (

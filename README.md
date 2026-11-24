@@ -55,22 +55,31 @@ symbol art, navy or blue-gray junction dots, red no-ERC crosses, and maroon
 net labels and power-port glyphs (bar, circle, and earth styles). Colors a
 PDF/A re-encoder has moved a few steps off this palette (for example
 `#000080` to `#000081`) are snapped back onto it. Fully transparent marker
-text is dropped, coalesced designator/value spans are split, and
-coordinates are snapped to a 0.05 mm grid to absorb the generator's float
-noise; coordinates within 0.02 mm of each other snap to the same grid point.
-A net label attaches to the wire under its baseline. Power ports drawn edge
-to edge, such as GND bars on adjacent pins, each become their own port, and
-port names are shared out nearest first; a text whose baseline lies on a
-wire is a net label, never a port name. Because such projects use flat
-net-identifier scope, every net label becomes a KiCad global label. Titles,
-page numbers,
-and sheet names are read from the sheet-template title block; the template
-itself stays residual graphics. Not-fitted variant parts print dimmed gray
-and are recovered with KiCad's native do-not-populate state. Multi-channel
-designs can print one logical designator on several pages; duplicates are
-suffixed (`R13_2`) to keep the flat project annotation-unique. Buses, bus
-entries, and Altium ports (none appear in the validation design) are not yet
-recovered; per-object color overrides fall back to residual graphics.
+text is dropped, coalesced designator/value spans are split (`R5 0R`,
+`TP3TP4`, and a parameter printed above the designator and fused to it,
+`1%R12` or `10K1%R34`), and coordinates are snapped to a 0.05 mm grid to
+absorb the generator's float noise; coordinates within 0.02 mm of each other
+snap to the same grid point. Designators follow the Altium prefix list,
+which adds relays (`K1A`), board-to-board connectors (`JM1`), jumpers,
+mounting holes, lamps, resistor networks and Zener diodes to the Capture
+list; a passive's value is never one of its printed tolerance, voltage,
+current or package parameters. A net label attaches to the wire under its
+baseline. Power ports drawn edge to edge, such as GND bars on adjacent pins,
+each become their own port, and port names are shared out nearest first; a
+text whose baseline lies on a wire is a net label, never a port name, and
+two port names printed as one span (`GNDGND`) are split again. Because such
+projects use flat net-identifier scope, every net label becomes a KiCad
+global label, and so does every Altium port: the filled arrow or box drawn
+in the accent colour with its name inside becomes a global label at the
+side a wire or pin ends on. Titles, page numbers, and sheet names are read
+from the sheet-template title block; the template itself stays residual
+graphics. Not-fitted variant parts print dimmed gray and are recovered with
+KiCad's native do-not-populate state; because a gray pin stub and a gray
+body edge share colour and width, a stroke counts as a pin only when one of
+its ends hangs free of the rest of the part. Multi-channel designs can print
+one logical designator on several pages; duplicates are suffixed (`R13_2`)
+to keep the flat project annotation-unique. Buses and bus entries are not
+yet recovered; per-object color overrides fall back to residual graphics.
 
 Values ending in `*DNP` are cleaned and emitted with KiCad's native
 do-not-populate state and BOM exclusion. Optional passive enrichment can infer

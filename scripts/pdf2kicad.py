@@ -55,6 +55,7 @@ PIN_NAME_COLOR = pdf_dump.PIN_NAME_COLOR
 WIRE_COLOR = pdf_dump.WIRE_COLOR
 BUS_COLOR = "#0000ff"
 REF_RE = pdf_dump.REF_RE
+ALTIUM_REF_RE = pdf_dump.ALTIUM_REF_RE
 GEOM_TOL = pdf_dump.GEOM_TOL
 BODY_CURVE_JOIN_TOL = 0.06
 BODY_HALF_JOIN_TOL = 1.5
@@ -72,7 +73,7 @@ PIN_TEXT_SIZE = 1.27
 DNP_SUFFIX_RE = re.compile(r"\s*\*DNP\s*$", re.IGNORECASE)
 LABEL_RE = re.compile(r"^[A-Za-z_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
 # Altium net and rail names may begin with a digit ("1V2_MEM", "3.3V").
-ALTIUM_NET_NAME_RE = re.compile(r"^[A-Za-z0-9_+][A-Za-z0-9_./+#\-\[\]<>:]*$")
+ALTIUM_NET_NAME_RE = re.compile(r"^[A-Za-z0-9_+\-][A-Za-z0-9_./+#\-\[\]<>:]*$")
 GLOBAL_LABEL_PAGE_REFERENCE_RE = pdf_dump.GLOBAL_LABEL_PAGE_REFERENCE_RE
 MECHANICAL_REF_RE = re.compile(r"^(?:SCR|SP)\d+[A-Z]?$")
 MULTI_UNIT_REF_RE = re.compile(r"^([A-Z]{1,4}\d+)([A-Z])$")
@@ -346,6 +347,80 @@ def _looks_like_passive_value(value: str) -> bool:
     )
 
 
+def _split_parameter_reference(value: str) -> tuple[str, ...] | None:
+    """Split an Altium span whose designator follows a parameter.
+
+    llPDFLib merges a tolerance printed right above the designator with it
+    (``1%R12``, ``5%C3``), and a value fused to that tolerance stays fused
+    (``10K1%R34``).  The reference is the longest designator-shaped tail;
+    the head splits again at a trailing tolerance when a value precedes it.
+    """
+    match = re.fullmatch(r"(\S+?)([A-Z]{1,4}\d+[A-Z]?)", value)
+    if not match:
+        return None
+    head, reference = match.groups()
+    if not ALTIUM_REF_RE.fullmatch(reference) or not re.search(r"\d", head):
+        return None
+    if not (head.endswith("%") or _looks_like_passive_value(head)):
+        return None
+    tolerance = re.fullmatch(r"(\S+?)(\d+(?:\.\d+)?%)", head)
+    if tolerance and _looks_like_passive_value(tolerance.group(1)):
+        return (tolerance.group(1), tolerance.group(2), reference)
+    return (head, reference)
+
+
+def _split_text_span(text: dict, parts: tuple[str, ...]) -> list[dict]:
+    """Cut one text span into consecutive spans, proportionally by length."""
+    original = text.get("text", "").strip()
+    total = max(len(original), 1)
+    horizontal = int(round(text.get("angle", 0))) % 180 == 0
+    start_key, end_key = ("x", "x1") if horizontal else ("y", "y1")
+    origin = text[start_key]
+    extent = text[end_key] - text[start_key]
+    pieces = []
+    consumed = 0
+    start = origin
+    for position, part in enumerate(parts):
+        consumed += len(part)
+        end = (
+            text[end_key]
+            if position == len(parts) - 1
+            else origin + extent * (consumed / total)
+        )
+        piece = {**text, "text": part, start_key: start, end_key: end}
+        pieces.append(piece)
+        start = end
+    return pieces
+
+
+PASSIVE_PARAMETER_RE = re.compile(
+    r"^(?:"
+    r"[+-]?\d+(?:\.\d+)?\s?%"          # tolerance: 1%, 5%, +-20%
+    r"|\d+(?:\.\d+)?\s?[kKmM]?V(?:DC|AC)?"  # voltage rating: 16V, 6.3V, 1kV
+    r"|\d+(?:\.\d+)?\s?[muµ]?A"        # current rating: 1A, 500mA
+    r"|\d+(?:\.\d+)?\s?[mkKM]?W|\d+/\d+\s?W"  # power: 0.1W, 1/10W
+    r"|\d{4}|\d{4}/\d{4}"               # package code: 0603, 0603/1608
+    r"|\d+\s?ppm(?:/[CK])?"              # temperature coefficient
+    r"|[+-]"                              # polarity mark of an electrolytic
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _is_passive_parameter(value: str) -> bool:
+    """Whether a text is a tolerance, rating, dielectric or package code.
+
+    Altium libraries often print such parameters under a passive's value, and in a
+    dense bank the nearest unconsumed text is often one of them.  None of
+    them is ever a passive's value, so they are not value candidates.
+    """
+    token = value.strip()
+    return (
+        token.upper() in pdf_dump.REFERENCE_STOP_WORDS
+        or bool(PASSIVE_PARAMETER_RE.match(token))
+    )
+
+
 def _split_merged_reference_values(page: dict) -> None:
     """Split Capture text spans such as ``R4110K/0603`` and ``TP6TP_PAD``.
 
@@ -358,6 +433,7 @@ def _split_merged_reference_values(page: dict) -> None:
     preserves indexes already recorded by ``pdf_dump.decode_page``.
     """
     texts = page.get("texts", [])
+    reference_re = pdf_dump.reference_re(page.get("flavor"))
     known: dict[str, list[int]] = {}
     for text in texts:
         match = re.fullmatch(
@@ -375,7 +451,7 @@ def _split_merged_reference_values(page: dict) -> None:
         original = text.get("text", "").strip()
         if (
             text.get("color") != "#000000"
-            or REF_RE.fullmatch(original)
+            or reference_re.fullmatch(original)
         ):
             continue
         if page.get("flavor") == "altium":
@@ -383,7 +459,7 @@ def _split_merged_reference_values(page: dict) -> None:
             # its value ("R5 0R") or two designators ("TP3TP4").
             parts = None
             space_match = re.fullmatch(r"(\S+)\s+(\S.*)", original)
-            if space_match and REF_RE.fullmatch(space_match.group(1)):
+            if space_match and reference_re.fullmatch(space_match.group(1)):
                 parts = space_match.groups()
             else:
                 pair_match = re.fullmatch(
@@ -391,25 +467,14 @@ def _split_merged_reference_values(page: dict) -> None:
                 )
                 if pair_match:
                     parts = pair_match.groups()
-            if parts:
-                first, second = parts
-                first_text = {**text, "text": first}
-                second_text = {**text, "text": second}
-                split_fraction = len(first) / len(original)
-                if int(round(text.get("angle", 0))) % 180 == 0:
-                    split = (
-                        text["x"] + (text["x1"] - text["x"]) * split_fraction
-                    )
-                    first_text["x1"] = split
-                    second_text["x"] = split
                 else:
-                    split = (
-                        text["y"] + (text["y1"] - text["y"]) * split_fraction
-                    )
-                    first_text["y1"] = split
-                    second_text["y"] = split
-                texts[index] = first_text
-                additions.append(second_text)
+                    # A parameter printed above the designator fuses with
+                    # it ("1%R12", "10K1%R34"): the tail is the reference.
+                    parts = _split_parameter_reference(original)
+            if parts:
+                pieces = _split_text_span(text, parts)
+                texts[index] = pieces[0]
+                additions.extend(pieces[1:])
                 continue
         testpoint_match = re.fullmatch(
             r"(TP\d+[A-Z]?)(TP_PAD)",
@@ -1220,7 +1285,9 @@ def _repair_mismatched_references(page: dict, components: list[dict]) -> None:
         for text in page["texts"]
         if (
             text.get("color") == "#000000"
-            and REF_RE.match(text.get("text", "").strip())
+            and pdf_dump.reference_re(page.get("flavor")).match(
+                text.get("text", "").strip()
+            )
         )
     ]
     reserved = {
@@ -2062,6 +2129,7 @@ def assign_values(
     page: dict, components: list[dict], consumed_texts: set[tuple]
 ) -> None:
     wires = (page.get("decoded") or {}).get("wires", [])
+    reference_re = pdf_dump.reference_re(page.get("flavor"))
     labels_wire: dict[int, bool] = {}
     aligned_pair_scores = []
     body_pair_scores = []
@@ -2088,7 +2156,7 @@ def assign_values(
             if (
                 not value
                 or text.get("color") != "#000000"
-                or REF_RE.match(value)
+                or reference_re.match(value)
             ):
                 continue
             if (
@@ -2135,6 +2203,8 @@ def assign_values(
                 cross_offset = dx
                 along_distance = abs(dy)
             passive_prefix = reference_prefix in ("R", "C", "L", "FB")
+            if passive_prefix and _is_passive_parameter(value):
+                continue
             ordering_code_penalty = (
                 20.0
                 if passive_prefix and not _looks_like_passive_value(value)
@@ -3239,11 +3309,257 @@ def decode_net_labels_altium(
     return labels
 
 
+REPEATED_NAME_RE = re.compile(r"^(\S{3,})\1+$")
+
+
+def _split_repeated_net_names(page: dict) -> None:
+    """Split ``GNDGND``: two ports printed edge to edge share one span.
+
+    llPDFLib merges adjacent texts of one line into a single span, so two
+    power ports whose names touch print as the name repeated.  Each copy is
+    its own port name; the span is cut into equal parts.
+    """
+    accent = pdf_dump.ALTIUM_ACCENT_COLOR
+    texts = page.get("texts", [])
+    additions = []
+    for index, text in enumerate(list(texts)):
+        if text.get("color") != accent:
+            continue
+        value = text.get("text", "").strip()
+        match = REPEATED_NAME_RE.fullmatch(value)
+        if not match or not ALTIUM_NET_NAME_RE.match(match.group(1)):
+            continue
+        token = match.group(1)
+        pieces = _split_text_span(text, (token,) * (len(value) // len(token)))
+        texts[index] = pieces[0]
+        additions.extend(pieces[1:])
+    texts.extend(additions)
+
+
+def bridge_wire_hops_altium(
+    page: dict, wires: list[dict], consumed_curves: set[int]
+) -> list[dict]:
+    """Rejoin a wire that hops over another with a small arc.
+
+    With wire hops displayed, Altium prints a crossing as two collinear
+    wire pieces and a semicircle in the wire colour bridging the gap.  The
+    wire is electrically one; the wire it crosses is not connected to it.
+    A straight wire across the gap reproduces that in KiCad, where a wire
+    passing over another without a junction does not connect.
+    """
+    accent_wire = pdf_dump.ALTIUM_WIRE_COLOR
+    arcs = []
+    for index, curve in enumerate(page.get("curves", [])):
+        if (
+            index in consumed_curves
+            or curve.get("color") != accent_wire
+            or curve.get("fill")
+            or float(curve.get("width") or 0.0) < 0.1
+        ):
+            continue
+        bbox = _curve_bbox(curve)
+        span = max(bbox["x1"] - bbox["x0"], bbox["y1"] - bbox["y0"])
+        if 0.4 <= span <= 3.0:
+            arcs.append((index, bbox))
+    if not arcs:
+        return []
+    ends = []
+    for wire in wires:
+        for key in ("start", "end"):
+            ends.append(((wire[key]["x"], wire[key]["y"]), wire))
+    bridges = []
+    used_arcs = set()
+    for first in range(len(ends)):
+        (ax, ay), wire_a = ends[first]
+        for second in range(first + 1, len(ends)):
+            (bx, by), wire_b = ends[second]
+            if wire_a is wire_b:
+                continue
+            horizontal = abs(ay - by) <= GEOM_TOL and 0.4 <= abs(ax - bx) <= 3.0
+            vertical = abs(ax - bx) <= GEOM_TOL and 0.4 <= abs(ay - by) <= 3.0
+            if not (horizontal or vertical):
+                continue
+            gap = {
+                "x0": min(ax, bx) - GEOM_TOL,
+                "y0": min(ay, by) - GEOM_TOL,
+                "x1": max(ax, bx) + GEOM_TOL,
+                "y1": max(ay, by) + GEOM_TOL,
+            }
+            covering = [
+                index
+                for index, bbox in arcs
+                if (
+                    bbox["x0"] >= gap["x0"] - 0.3
+                    and bbox["x1"] <= gap["x1"] + 0.3
+                    and bbox["y0"] >= gap["y0"] - 3.0
+                    and bbox["y1"] <= gap["y1"] + 3.0
+                    and (
+                        (horizontal and (abs(bbox["y0"] - ay) <= 0.3 or abs(bbox["y1"] - ay) <= 0.3))
+                        or (vertical and (abs(bbox["x0"] - ax) <= 0.3 or abs(bbox["x1"] - ax) <= 0.3))
+                    )
+                )
+            ]
+            if not covering:
+                continue
+            reach = min(bbox["x0"] for index, bbox in arcs if index in covering) if horizontal else min(bbox["y0"] for index, bbox in arcs if index in covering)
+            far = max(bbox["x1"] for index, bbox in arcs if index in covering) if horizontal else max(bbox["y1"] for index, bbox in arcs if index in covering)
+            lo, hi = (min(ax, bx), max(ax, bx)) if horizontal else (min(ay, by), max(ay, by))
+            if reach > lo + 0.3 or far < hi - 0.3:
+                continue
+            bridges.append({
+                "start": {"x": ax, "y": ay},
+                "end": {"x": bx, "y": by},
+                "length": math.hypot(bx - ax, by - ay),
+                "hop": True,
+            })
+            used_arcs.update(covering)
+    consumed_curves.update(used_arcs)
+    return bridges
+
+
+def decode_ports_altium(
+    page: dict,
+    wires: list[dict],
+    components: list[dict],
+    consumed_texts: set[tuple],
+    consumed_lines: set[int],
+) -> list[dict]:
+    """Altium ports: a filled arrow or box in the accent colour, named inside.
+
+    Altium draws a port as a closed polygon (left, right, both-ended arrow
+    or plain box) stroked in the accent colour over a fill, with the port
+    name inside it.  Its electrical point is the middle of the side a wire
+    or pin ends on.  Under flat net-identifier scope a port name is the net
+    name, so each port becomes a KiCad global label at that point.
+    """
+    accent = pdf_dump.ALTIUM_ACCENT_COLOR
+    records = []
+    for index, line in enumerate(page["lines"]):
+        if (
+            index in consumed_lines
+            or line.get("color") != accent
+            or not line.get("fill")
+            or line.get("dashed")
+            or float(line.get("width") or 0.0) > 0.12
+            or pdf_dump._line_length(line) < GEOM_TOL
+        ):
+            continue
+        records.append((index, line, _bbox_for_lines([line])))
+    if not records:
+        return []
+
+    parent = list(range(len(records)))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    for first in range(len(records)):
+        for second in range(first + 1, len(records)):
+            if _bboxes_touch(records[first][2], records[second][2], 0.3):
+                root_first, root_second = find(first), find(second)
+                if root_first != root_second:
+                    parent[root_second] = root_first
+    groups: dict[int, list[int]] = {}
+    for item in range(len(records)):
+        groups.setdefault(find(item), []).append(item)
+
+    pin_hots = [
+        (pin["hot"]["x"], pin["hot"]["y"])
+        for component in components
+        for pin in component.get("pins", [])
+    ]
+    name_candidates = [
+        text
+        for text in page["texts"]
+        if (
+            text.get("color") == accent
+            and _text_key(text) not in consumed_texts
+            and ALTIUM_NET_NAME_RE.match(text.get("text", "").strip())
+        )
+    ]
+    ports = []
+    for group in groups.values():
+        if len(group) < 3:
+            continue
+        lines = [records[item][1] for item in group]
+        bbox = _bbox_for_lines(lines)
+        width = bbox["x1"] - bbox["x0"]
+        height = bbox["y1"] - bbox["y0"]
+        if max(width, height) < 3.0 or min(width, height) < 1.0:
+            continue
+        inside = [
+            text
+            for text in name_candidates
+            if _point_in_bbox(
+                (
+                    (text["x"] + text["x1"]) / 2,
+                    (text["y"] + text["y1"]) / 2,
+                ),
+                bbox,
+                0.3,
+            )
+        ]
+        if len(inside) != 1:
+            continue
+        text = inside[0]
+        center = (
+            (bbox["x0"] + bbox["x1"]) / 2,
+            (bbox["y0"] + bbox["y1"]) / 2,
+        )
+        if width >= height:
+            sides = [
+                ((bbox["x0"], center[1]), "right"),
+                ((bbox["x1"], center[1]), "left"),
+            ]
+        else:
+            sides = [
+                ((center[0], bbox["y0"]), "down"),
+                ((center[0], bbox["y1"]), "up"),
+            ]
+        hits = []
+        for point, direction in sides:
+            wire_hit = _point_on_any_wire(point, wires, 0.3)
+            if wire_hit:
+                hits.append((wire_hit[1], direction))
+            elif any(_distance(point, pin) <= 0.3 for pin in pin_hots):
+                hits.append((point, direction))
+        if not hits:
+            continue
+        name = text["text"].strip()
+        for point, direction in hits:
+            ports.append({
+                "name": name,
+                "point": point,
+                "kind": "global",
+                "angle": {
+                    "right": 0,
+                    "left": 180,
+                    "up": 90,
+                    "down": 270,
+                }[direction],
+                "direction": direction,
+                "port": True,
+            })
+        consumed_texts.add(_text_key(text))
+        consumed_lines.update(records[item][0] for item in group)
+    ports.sort(key=lambda port: (port["point"][1], port["point"][0]))
+    return ports
+
+
 def decode_page(page: dict) -> dict:
     flavor = page.get("flavor")
     decoded = page.get("decoded") or pdf_dump.decode_page(page)
     buses = decode_buses(page)
     wires, bus_entries = decode_bus_entries(decoded["wires"], buses)
+    hop_curves: set[int] = set()
+    if flavor == "altium":
+        bridges = bridge_wire_hops_altium(page, wires, hop_curves)
+        wires.extend(bridges)
+        if decoded["wires"] is not wires:
+            decoded["wires"].extend(bridges)
     components, consumed_texts, semantic_lines = decode_components(page)
     semantic_rectangles = {
         index
@@ -3255,13 +3571,16 @@ def decode_page(page: dict) -> dict:
         for component in components
         for index in component.get("curve_indexes", set())
     }
+    semantic_curves.update(hop_curves)
     junctions = decode_junctions(page, wires, semantic_curves)
     no_connects = decode_no_connects(
         page,
         components,
         semantic_lines,
     )
+    ports = []
     if flavor == "altium":
+        _split_repeated_net_names(page)
         power_ports = decode_power_ports_altium(
             page,
             wires,
@@ -3269,6 +3588,13 @@ def decode_page(page: dict) -> dict:
             consumed_texts,
             semantic_lines,
             semantic_curves,
+        )
+        ports = decode_ports_altium(
+            page,
+            wires,
+            components,
+            consumed_texts,
+            semantic_lines,
         )
     else:
         power_ports = decode_power_ports(
@@ -3281,7 +3607,9 @@ def decode_page(page: dict) -> dict:
     if flavor == "altium":
         # Flat net-identifier scope: every Altium net label merges by name
         # across all pages, which is exactly a KiCad global label.
-        global_labels = decode_net_labels_altium(page, wires, consumed_texts)
+        global_labels = ports + decode_net_labels_altium(
+            page, wires, consumed_texts
+        )
         local_labels = []
     else:
         global_labels = decode_global_labels(
