@@ -4071,11 +4071,9 @@ class AltiumWireHopTests(unittest.TestCase):
              "width": 0.254, "points": arc_points(x, y, radius, 0, 90)},
         ]
 
-    # Pdf2KiCad-6ue: the covering test applies the horizontal-hop
-    # bounds to vertical hops, so the sideways bulge rejects the arc.
-    @unittest.expectedFailure
     def test_vertical_hop_arc_rejoins_the_wire(self):
-        # A vertical wire hops over a horizontal one.
+        # A vertical wire hops over a horizontal one, its arc bulging
+        # sideways out of the gap (Pdf2KiCad-6ue).
         wires = [
             wire(40.0, 20.0, 40.0, 29.24),
             wire(40.0, 30.76, 40.0, 45.0),
@@ -4091,8 +4089,6 @@ class AltiumWireHopTests(unittest.TestCase):
         )
         self.assertEqual(consumed, {0, 1})
 
-    # Pdf2KiCad-6ue
-    @unittest.expectedFailure
     def test_vertical_wire_across_a_pin_bank_stays_one_wire(self):
         # A wire runs down beside a header and hops over each of its pin
         # wires; every hop must be bridged.

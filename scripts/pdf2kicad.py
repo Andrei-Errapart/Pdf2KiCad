@@ -3385,14 +3385,18 @@ def bridge_wire_hops_altium(
                 "x1": max(ax, bx) + GEOM_TOL,
                 "y1": max(ay, by) + GEOM_TOL,
             }
+            # The arc stays within the gap along the wire and bulges to
+            # one side across it: sideways for a vertical wire.
+            along, across = 0.3, 3.0
+            margin_x, margin_y = (along, across) if horizontal else (across, along)
             covering = [
                 index
                 for index, bbox in arcs
                 if (
-                    bbox["x0"] >= gap["x0"] - 0.3
-                    and bbox["x1"] <= gap["x1"] + 0.3
-                    and bbox["y0"] >= gap["y0"] - 3.0
-                    and bbox["y1"] <= gap["y1"] + 3.0
+                    bbox["x0"] >= gap["x0"] - margin_x
+                    and bbox["x1"] <= gap["x1"] + margin_x
+                    and bbox["y0"] >= gap["y0"] - margin_y
+                    and bbox["y1"] <= gap["y1"] + margin_y
                     and (
                         (horizontal and (abs(bbox["y0"] - ay) <= 0.3 or abs(bbox["y1"] - ay) <= 0.3))
                         or (vertical and (abs(bbox["x0"] - ax) <= 0.3 or abs(bbox["x1"] - ax) <= 0.3))
