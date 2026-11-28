@@ -11,3 +11,6 @@ __pycache__/
 web/runtime/
 web/py/
 web/version.json
+
+# Beads / Dolt files (added by bd init)
+*.gate.lock*
