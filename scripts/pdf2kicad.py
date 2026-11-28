@@ -3126,7 +3126,7 @@ def decode_power_ports_altium(
     # Share the names out nearest pair first, page-wide: a port's name may
     # lie closer to a neighbouring glyph than that neighbour's own name.
     pairs = []
-    for glyph_index, (_hot, items) in enumerate(glyphs):
+    for glyph_index, (hot, items) in enumerate(glyphs):
         bbox = _bbox_union(*(records[item][3] for item in items))
         for text_index, text in enumerate(page["texts"]):
             value = text.get("text", "").strip()
@@ -3134,7 +3134,10 @@ def decode_power_ports_altium(
                 text.get("color") != accent
                 or _text_key(text) in consumed_texts
                 or not ALTIUM_NET_NAME_RE.match(value)
-                or _altium_label_on_wire(text, wires)
+                or (
+                    _altium_label_on_wire(text, wires)
+                    and not _placed_as_port_name(text, bbox, hot)
+                )
             ):
                 continue
             distance = _bbox_distance(bbox, _text_bbox(text))
@@ -3211,6 +3214,36 @@ def _altium_label_on_wire(text: dict, wires: list[dict]) -> bool:
         (bbox["x1"], bbox["y1"]),
     ]
     return _nearest_wire_point(baseline_points, wires, 0.3) is not None
+
+
+def _placed_as_port_name(text: dict, glyph_bbox: dict, hot) -> bool:
+    """Whether a text sits where Altium prints a power port's name.
+
+    The name is centred on the port's stem, just past the end of the glyph
+    away from the hotpoint.  A name placed there is the port's even when its
+    baseline happens to touch a wire passing under the port.
+    """
+    box = _text_bbox(text)
+    center = ((box["x0"] + box["x1"]) / 2, (box["y0"] + box["y1"]) / 2)
+    away = (
+        (glyph_bbox["x0"] + glyph_bbox["x1"]) / 2 - hot[0],
+        (glyph_bbox["y0"] + glyph_bbox["y1"]) / 2 - hot[1],
+    )
+    if abs(away[1]) >= abs(away[0]):
+        offset = abs(center[0] - hot[0])
+        extent = box["x1"] - box["x0"]
+        if away[1] > 0:
+            gap = box["y0"] - glyph_bbox["y1"]
+        else:
+            gap = glyph_bbox["y0"] - box["y1"]
+    else:
+        offset = abs(center[1] - hot[1])
+        extent = box["y1"] - box["y0"]
+        if away[0] > 0:
+            gap = box["x0"] - glyph_bbox["x1"]
+        else:
+            gap = glyph_bbox["x0"] - box["x1"]
+    return offset <= max(0.6, 0.2 * extent) and -0.1 <= gap <= 0.6
 
 
 def _power_glyph_at(records: list, group: list[int], hot) -> list[int]:

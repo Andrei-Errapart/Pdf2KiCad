@@ -4339,13 +4339,37 @@ class AltiumPowerPortTests(unittest.TestCase):
             [("GND", (95.35, 147.7)), ("VBUS", (97.2, 149.55))],
         )
 
-    # Pdf2KiCad-apu: the name is taken as a GND net label on the
-    # passing wire, which shorts that wire's net to GND and leaves the
-    # port without a name.
-    @unittest.expectedFailure
+    def test_label_well_below_a_nameless_port_stays_a_label(self):
+        # A GND bar whose name is hidden, and a net label on a wire 1 mm
+        # below it, centred on the stem: too far from the bar to be the
+        # port's name, so it stays a label on its own wire.
+        sense = wire(40.0, 50.9, 80.0, 50.9)
+        page = altium_page(
+            lines=[
+                altium_line("#800000", 60.0, 45.0, 60.0, 47.55),
+                altium_line("#800000", 58.73, 47.55, 61.27, 47.55),
+            ],
+            texts=[
+                altium_text("SENSE", 56.3, 48.6, 63.7, 50.9, "#800000"),
+            ],
+        )
+        components = [{"pins": [{"hot": {"x": 60.0, "y": 45.0}}]}]
+        consumed_texts = set()
+        ports = pdf2kicad.decode_power_ports_altium(
+            page, [sense], components, consumed_texts, set(), set()
+        )
+        self.assertEqual(ports, [])
+        self.assertEqual(
+            [(label["name"], label["point"][1]) for label in
+             pdf2kicad.decode_net_labels_altium(page, [sense],
+                                                consumed_texts)],
+            [("SENSE", 50.9)],
+        )
+
     def test_port_name_over_a_passing_wire_stays_with_its_port(self):
         # A capacitor's GND bar sits just above an unrelated wire, and the
-        # GND name printed under the bar ends on that wire.
+        # GND name printed under the bar ends on that wire.  It is still the
+        # port's name, not a GND label shorting the wire (Pdf2KiCad-apu).
         passing = wire(30.0, 50.1, 100.0, 50.1)
         page = altium_page(
             lines=[
