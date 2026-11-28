@@ -8,7 +8,10 @@ geometry; `pdf2kicad.py` reconstructs KiCad projects. The extensionless
 that manage the PyMuPDF environment. `scripts/kicad_symbols/` holds reduced
 third-party copies of KiCad's `Device` and `Connector` symbol libraries, used by
 `--kicad-rcl` so standard-symbol substitution works without a local KiCad
-installation. Unit tests are consolidated in `tests/test_pdf2kicad.py`. Keep
+installation. Unit tests are consolidated in `tests/test_pdf2kicad.py`;
+`tests/synthetic_schematics.py` draws the synthetic schematic PDFs that
+`tests/test_synthetic_schematics.py` converts end to end. `SOURCES.md` lists
+the public schematics the repository draws on. Keep
 generated `.kicad_sch`, `.kicad_pro`, and `.kicad_wks` files in a separate
 output directory, not alongside source files, and do not commit them.
 
@@ -24,6 +27,29 @@ third-party code, recorded in `web/vendor/README.md`. `web/runtime/` and
 `web/py/` are build products of `scripts/build-web` and are not committed.
 JavaScript tests and their fixtures live in `tests/web/`, outside the served
 directory. The design is `doc/specs/2026-10-03-web-converter-design.md`.
+
+## Data Policy
+
+This work is based on publicly available and fully synthetic data only.
+
+- Every fixture, generated PDF and example in tests, code comments and
+  documentation is either invented for the purpose or taken from a
+  schematic that its owner publishes for anyone to download. Invented means
+  all of it: designators, values, part numbers, net, bus and sheet names,
+  title-block text and coordinates. Data taken from a public schematic names
+  its source where it is used, and the schematic is listed in `SOURCES.md`,
+  with where to download it, before any of its data is used.
+- Nothing from a non-public schematic enters the repository: not the PDF,
+  not data copied, transformed or derived from it, not its name, and no
+  statistics or results measured on it. This covers code, tests, fixtures,
+  documentation, commit messages and beads, whose database is pushed to the
+  git remote with the code.
+- A recovery bug found on a non-public PDF is written up as its mechanism
+  and reproduced with an invented fixture. Any check against such a PDF
+  runs in a scratch directory outside the repository and leaves nothing in
+  it.
+- End-to-end validation uses the synthetic schematics drawn by
+  `tests/synthetic_schematics.py` and the public schematics in `SOURCES.md`.
 
 ## Build, Test, and Development Commands
 
@@ -52,6 +78,9 @@ directory. The design is `doc/specs/2026-10-03-web-converter-design.md`.
 - `python3 -m http.server -d web 8000` serves the page locally.
 - `python3 tests/web/make_fixtures.py` regenerates the committed web test
   fixtures; it needs PyMuPDF.
+- `python3 tests/synthetic_schematics.py out_dir` writes the synthetic
+  schematic PDFs and their reference netlists for a comparison by hand; it
+  needs PyMuPDF.
 - `kicad-cli sch export netlist output_dir/project.kicad_sch` exports a netlist
   for connectivity comparison.
 
@@ -93,8 +122,9 @@ Exception terms — in sync.
 
 Tests use `unittest`; name classes `*Tests` and methods `test_*`, grouped by
 recovered feature (worksheet, power symbols, global labels, buses, and so on).
-Add a focused regression fixture for every recovery bug, using small in-memory
-page, component, line, or text dictionaries when possible. Assert both the
+Add a focused regression fixture, with invented data, for every recovery bug,
+using small in-memory page, component, line, or text dictionaries when
+possible. Assert both the
 recovered semantic object and consumption of source graphics where relevant.
 Keep tests self-contained: no outside PDFs, no network, no real KiCad
 installation. Tests that need a PDF draw one in memory with PyMuPDF. Web
@@ -102,7 +132,11 @@ tests use `node:test`, one `tests/web/<module>.test.mjs` per module, with
 small synthetic fixtures written by `tests/web/make_fixtures.py`. Run both
 suites before submitting. A change to the page's behavior in a browser is
 additionally checked by hand against the checklist in the web converter
-spec.
+spec. End-to-end recovery is validated with synthetic schematics:
+`tests/test_synthetic_schematics.py` converts the PDFs that
+`tests/synthetic_schematics.py` draws and compares the recovered nets with
+the ones they were drawn with, and the public schematics in `SOURCES.md`
+serve for checks by hand.
 
 ## Commit & Pull Request Guidelines
 

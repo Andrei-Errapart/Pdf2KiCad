@@ -127,8 +127,8 @@ The converter refuses input it cannot do anything useful with, printing a
 one-line reason and exiting with status 1: a file that is not a readable PDF,
 a password-protected PDF, a PDF with no vector drawings on any page (a scan),
 and a PDF with a page of more than 12,000 drawing objects. The last is how
-PCB layout plots and placement maps are told from schematic sheets — a layout
-page carries far more drawing objects than a schematic sheet — and it replaces
+PCB layout plots and placement maps are told from schematic sheets — the
+densest page of the public schematics in `SOURCES.md` has 1,533 — and it replaces
 a decode that would otherwise run for many minutes.
 
 ## Web converter
@@ -167,6 +167,23 @@ every push to `main`. Third-party code and its licences are recorded in
 
 ## Validation
 
+The project is based on publicly available and fully synthetic data only;
+[SOURCES.md](SOURCES.md) lists the public schematics it draws on. End-to-end
+recovery is checked on synthetic schematics: `tests/synthetic_schematics.py`
+draws OrCAD-style and Altium-style schematic PDFs with known connectivity,
+and `tests/test_synthetic_schematics.py` converts them and requires the nets,
+net names and values they were drawn with. For a comparison with KiCad by
+hand,
+
+```sh
+python3 tests/synthetic_schematics.py out/synthetic
+```
+
+writes each PDF next to its reference netlist; convert the PDFs with
+`scripts/pdf2kicad` and export the results with `kicad-cli sch export
+netlist`. The public schematics in `SOURCES.md` serve for further checks by
+hand.
+
 Run the self-contained unit tests with:
 
 ```sh
@@ -180,9 +197,6 @@ requires identical output; the second covers the page's own modules. The
 tests that need `web/runtime/` are skipped until `scripts/build-web` has
 been run, and fail instead when `PDF2KICAD_REQUIRE_WEB=1` is set, as it is in
 CI.
-
-For connectivity comparisons, export the generated schematic's netlist with
-`kicad-cli sch export netlist`.
 
 ## License
 
