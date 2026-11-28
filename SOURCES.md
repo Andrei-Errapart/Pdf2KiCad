@@ -59,9 +59,10 @@ Everything not attributed below is invented:
   (Altium Designer, llPDFLib), git blob
   `09117c1a0ed8dcabf0b17a1ba6e48c9568a6d7e8`, SHA-256
   `865d54528686365fcf76291796ba599464dcb8f6431815bac40b5608878a3a9f`.
-- Used in: the commit "pdf2kicad: recover Altium PDFs re-encoded to PDF/A";
-  bead Pdf2KiCad-4ic (dual-row header numbering); the drawing counts quoted
-  in `README.md`.
+- Used in: the commits "pdf2kicad: recover Altium PDFs re-encoded to
+  PDF/A" and "pdf_dump: read pin numbers printed inside the body on the
+  pin's row" (headers P1, P2 and P3); bead Pdf2KiCad-4ic (dual-row header
+  numbering); the drawing counts quoted in `README.md`.
 
 ### ESP32-C3 0.42" OLED board, 01Space
 
@@ -80,5 +81,6 @@ Everything not attributed below is invented:
   kept locally as `esp32-c3-abrobot-oled_schematic.pdf`), git blob
   `4abb5b316d6282475c3d2213472d152d853d1ebe`, SHA-256
   `b9c3eab4e10bbf386855f358b2fa5ed137b8896fa8153f56c5c5375dc1d73317`.
-- Used in: the commit "pdf2kicad: recover Altium PDFs re-encoded to PDF/A";
-  the drawing counts quoted in `README.md`.
+- Used in: the commits "pdf2kicad: recover Altium PDFs re-encoded to
+  PDF/A" and "pdf_dump: read pin numbers printed inside the body on the
+  pin's row" (header JP1); the drawing counts quoted in `README.md`.

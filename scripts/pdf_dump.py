@@ -560,6 +560,20 @@ def _text_distance_to_point(text: dict, x: float, y: float) -> float:
 
 
 def _pin_number_score(pin: dict, text: dict) -> float | None:
+    scores = [
+        score
+        for score in (
+            _pin_number_beside_score(pin, text),
+            _pin_number_inside_score(pin, text),
+        )
+        if score is not None
+    ]
+    return min(scores) if scores else None
+
+
+def _pin_number_beside_score(pin: dict, text: dict) -> float | None:
+    """A number printed beside the pin: above a horizontal pin, left of a
+    vertical one, towards the body end."""
     hot = pin["hot"]
     other = pin["other"]
     side = pin["side"]
@@ -585,6 +599,32 @@ def _pin_number_score(pin: dict, text: dict) -> float | None:
         if left and between_or_near_segment and horizontally_near:
             target_y = other["y"]
             return abs(x - cx) + abs(target_y - cy)
+    return None
+
+
+def _pin_number_inside_score(pin: dict, text: dict) -> float | None:
+    """A number printed inside the body on the pin's own row, as some
+    connector symbols do: a plain number centred on the pin's line, just
+    inside the edge the pin meets."""
+    if not text.get("text", "").strip().isdigit():
+        return None
+    hot = pin["hot"]
+    other = pin["other"]
+    cx, cy = _text_center(text)
+    if pin["side"] in ("left", "right"):
+        across = abs(cy - hot["y"])
+        if other["x"] > hot["x"]:
+            inward = text["x"] - other["x"]
+        else:
+            inward = other["x"] - text["x1"]
+    else:
+        across = abs(cx - hot["x"])
+        if other["y"] > hot["y"]:
+            inward = text["y"] - other["y"]
+        else:
+            inward = other["y"] - text["y1"]
+    if across <= 0.5 and -0.5 <= inward <= 2.5:
+        return abs(inward) + across
     return None
 
 

@@ -4524,6 +4524,69 @@ class AltiumPageDecodeTests(unittest.TestCase):
         self.assertIn('(property "Reference" "U5"', rendered)
 
 
+class AltiumPinNumberTests(unittest.TestCase):
+    @staticmethod
+    def _dual_row_header(rows=4, x0=50.0, y0=40.0):
+        # A 2xN header whose library prints each pin number inside the
+        # body, on the pin's own row: odd numbers along the left edge, even
+        # numbers along the right one.
+        x1, y1 = x0 + 7.62, y0 + 2.54 * rows
+        lines = body_fill_lines(x0, y0, x1, y1)
+        texts = [altium_text("J7", x0, y0 - 2.3, x0 + 2.0, y0, "#000080")]
+        for index in range(rows):
+            row = y0 + 1.27 + 2.54 * index
+            lines += [
+                altium_line("#000000", x0 - 2.54, row, x0, row),
+                altium_line("#000000", x1, row, x1 + 2.54, row),
+            ]
+            for number, left in ((2 * index + 1, True), (2 * index + 2, False)):
+                width = 0.9 * len(str(number))
+                tx0 = x0 + 1.3 if left else x1 - 1.2 - width
+                texts.append(altium_text(str(number), tx0, row - 0.8,
+                                         tx0 + width, row + 0.8, "#000000",
+                                         font="Arial"))
+        rectangles = [{"x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                       "color": "#800000", "fill": None, "width": 0.042}]
+        return altium_page(lines=lines, rectangles=rectangles, texts=texts)
+
+    def test_numbers_inside_the_body_stay_on_their_rows(self):
+        # Pdf2KiCad-4ic: each left pin took the number of the row above it,
+        # and the right column's numbers were never matched.
+        semantic = decode_altium_page(self._dual_row_header())
+        (header,) = semantic["components"]
+        by_side = {}
+        for pin in sorted(header["pins"], key=lambda pin: pin["hot"]["y"]):
+            by_side.setdefault(pin["side"], []).append(pin.get("number"))
+        self.assertEqual(by_side, {"left": ["1", "3", "5", "7"],
+                                   "right": ["2", "4", "6", "8"]})
+
+    def test_numbers_inside_the_body_follow_downward_pins(self):
+        # A single-row header turned on its side, its pins leaving the
+        # bottom edge and numbered right to left, each number printed inside
+        # the body above its own pin.
+        x0, y0, columns = 80.0, 30.0, 3
+        x1, y1 = x0 + 2.54 * columns, y0 + 5.08
+        lines = body_fill_lines(x0, y0, x1, y1)
+        texts = [altium_text("J8", x0, y0 - 2.3, x0 + 2.0, y0, "#000080")]
+        for index in range(columns):
+            column = x0 + 1.27 + 2.54 * index
+            lines.append(altium_line("#000000", column, y1, column,
+                                     y1 + 2.54))
+            texts.append(altium_text(str(columns - index), column - 0.45,
+                                     y1 - 2.8, column + 0.45, y1 - 1.2,
+                                     "#000000", font="Arial"))
+        page = altium_page(lines=lines, texts=texts, rectangles=[{
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "color": "#800000", "fill": None, "width": 0.042,
+        }])
+        (header,) = decode_altium_page(page)["components"]
+        self.assertEqual(
+            [pin.get("number") for pin in
+             sorted(header["pins"], key=lambda pin: pin["hot"]["x"])],
+            ["3", "2", "1"],
+        )
+
+
 class AltiumTestPointTests(unittest.TestCase):
     @staticmethod
     def _page(count):
